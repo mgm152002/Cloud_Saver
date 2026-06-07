@@ -33,6 +33,15 @@ yarn-error.log*
 # env files (can opt-in for committing if needed)
 .env*
 
+# trigger.dev
+.trigger/
+
+# commandcode
+.commandcode/
+
+# supabase
+.supabase/
+
 # vercel
 .vercel
 
