@@ -188,9 +188,9 @@ export const aiRemediations = pgTable("ai_remediations", {
 
 export const chatSessions = pgTable("chat_sessions", {
   id: uuid("id").defaultRandom().primaryKey(),
-  organizationId: uuid("organization_id")
-    .references(() => organizations.id)
-    .notNull(),
+  userId: text("user_id").references(() => user.id, { onDelete: "cascade" }),
+  organizationId: uuid("organization_id").references(() => organizations.id),
+  cloudAccountId: uuid("cloud_account_id").references(() => cloudAccounts.id),
   title: varchar("title", { length: 255 }),
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
@@ -217,6 +217,21 @@ export const alerts = pgTable("alerts", {
   severity: varchar("severity", { length: 50 }),
   status: varchar("status", { length: 50 }).default("open"),
   createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+export const usagePolicies = pgTable("usage_policies", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  organizationId: uuid("organization_id")
+    .references(() => organizations.id)
+    .notNull(),
+  cloudAccountId: uuid("cloud_account_id").references(() => cloudAccounts.id),
+  monthlyLimit: numeric("monthly_limit", { precision: 12, scale: 2 }).notNull(),
+  alertThresholdPercent: integer("alert_threshold_percent").default(80).notNull(),
+  alertEmail: varchar("alert_email", { length: 320 }),
+  enabled: boolean("enabled").default(true).notNull(),
+  lastAlertSentAt: timestamp("last_alert_sent_at"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });
 
 // ============== RELATIONS ==============
@@ -253,6 +268,7 @@ export const organizationRelations = relations(organizations, ({ one, many }) =>
   aiRemediations: many(aiRemediations),
   chatSessions: many(chatSessions),
   alerts: many(alerts),
+  usagePolicies: many(usagePolicies),
 }));
 
 export const cloudAccountsRelations = relations(cloudAccounts, ({ one, many }) => ({
@@ -287,6 +303,7 @@ export const cloudResourcesRelations = relations(cloudResources, ({ one, many })
   resourceCostHistory: many(resourceCostHistory),
   aiRecommendations: many(aiRecommendations),
   alerts: many(alerts),
+  usagePolicies: many(usagePolicies),
 }));
 
 export const resourceCostHistoryRelations = relations(resourceCostHistory, ({ one }) => ({
@@ -319,9 +336,17 @@ export const aiRemediationsRelations = relations(aiRemediations, ({ one }) => ({
 }));
 
 export const chatSessionsRelations = relations(chatSessions, ({ one, many }) => ({
+  user: one(user, {
+    fields: [chatSessions.userId],
+    references: [user.id],
+  }),
   organization: one(organizations, {
     fields: [chatSessions.organizationId],
     references: [organizations.id],
+  }),
+  cloudAccount: one(cloudAccounts, {
+    fields: [chatSessions.cloudAccountId],
+    references: [cloudAccounts.id],
   }),
   messages: many(chatMessages),
 }));
@@ -341,5 +366,16 @@ export const alertsRelations = relations(alerts, ({ one }) => ({
   resource: one(cloudResources, {
     fields: [alerts.resourceId],
     references: [cloudResources.id],
+  }),
+}));
+
+export const usagePoliciesRelations = relations(usagePolicies, ({ one }) => ({
+  organization: one(organizations, {
+    fields: [usagePolicies.organizationId],
+    references: [organizations.id],
+  }),
+  cloudAccount: one(cloudAccounts, {
+    fields: [usagePolicies.cloudAccountId],
+    references: [cloudAccounts.id],
   }),
 }));

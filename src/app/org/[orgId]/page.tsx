@@ -340,6 +340,7 @@ export default function OrgDetailPage() {
             ))}
           </Box>
         )}
+
       </Box>
 
       {/* Connect AWS Dialog */}

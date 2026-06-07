@@ -16,10 +16,17 @@ import TextField from '@mui/material/TextField';
 import Button from '@mui/material/Button';
 import Divider from '@mui/material/Divider';
 import Tooltip from '@mui/material/Tooltip';
+import Card from '@mui/material/Card';
+import CardContent from '@mui/material/CardContent';
+import Stack from '@mui/material/Stack';
+import CircularProgress from '@mui/material/CircularProgress';
 import AddIcon from '@mui/icons-material/Add';
 import LogoutIcon from '@mui/icons-material/Logout';
 import DarkModeIcon from '@mui/icons-material/DarkMode';
 import LightModeIcon from '@mui/icons-material/LightMode';
+import ChatIcon from '@mui/icons-material/Chat';
+import CloseIcon from '@mui/icons-material/Close';
+import SendIcon from '@mui/icons-material/Send';
 import { useColorScheme } from '@mui/material/styles';
 import { authClient } from "../app/lib/auth-client";
 
@@ -27,11 +34,23 @@ interface DashboardLayoutProps {
   children: React.ReactNode;
 }
 
+interface AgentMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
 export default function DashboardLayout({ children }: DashboardLayoutProps) {
   const [anchorEl, setAnchorEl] = React.useState<null | HTMLElement>(null);
   const [addOrgOpen, setAddOrgOpen] = React.useState(false);
   const [orgName, setOrgName] = React.useState('');
   const [user, setUser] = React.useState<{ name?: string; email?: string; image?: string | null } | null>(null);
+  const [assistantOpen, setAssistantOpen] = React.useState(false);
+  const [chatSessionId, setChatSessionId] = React.useState<string | null>(null);
+  const [agentMessages, setAgentMessages] = React.useState<AgentMessage[]>([
+    { role: "assistant", content: "I can help across all organizations and accounts. Ask about cost, recommendations, metrics, or action plans." },
+  ]);
+  const [chatInput, setChatInput] = React.useState('');
+  const [chatting, setChatting] = React.useState(false);
   const { mode, setMode } = useColorScheme();
 
   React.useEffect(() => {
@@ -42,6 +61,22 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
       }
     };
     getUser();
+  }, []);
+
+  React.useEffect(() => {
+    let active = true;
+    fetch('/api/chat')
+      .then((response) => response.ok ? response.json() : null)
+      .then((data: { sessionId: string | null; messages: AgentMessage[] } | null) => {
+        if (!active || !data) return;
+        if (data.sessionId) setChatSessionId(data.sessionId);
+        if (data.messages.length > 0) setAgentMessages(data.messages);
+      })
+      .catch(() => undefined);
+
+    return () => {
+      active = false;
+    };
   }, []);
 
   const handleProfileMenuOpen = (event: React.MouseEvent<HTMLElement>) => {
@@ -94,6 +129,37 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
 
   const toggleMode = () => {
     setMode(mode === 'dark' ? 'light' : 'dark');
+  };
+
+  const handleGlobalChatSubmit = async () => {
+    const content = chatInput.trim();
+    if (!content) return;
+
+    const nextMessages: AgentMessage[] = [...agentMessages, { role: "user", content }];
+    setAgentMessages(nextMessages);
+    setChatInput('');
+    setChatting(true);
+
+    try {
+      const response = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: chatSessionId, messages: nextMessages }),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.message || 'Assistant failed');
+      }
+      setChatSessionId(data.sessionId);
+      setAgentMessages((current) => [...current, { role: "assistant", content: data.message }]);
+    } catch (error) {
+      setAgentMessages((current) => [
+        ...current,
+        { role: "assistant", content: error instanceof Error ? error.message : "Assistant failed" },
+      ]);
+    } finally {
+      setChatting(false);
+    }
   };
 
   return (
@@ -192,6 +258,96 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
       <Box component="main" sx={{ flexGrow: 1, p: { xs: 2, sm: 3 }, bgcolor: 'background.default', minHeight: 'calc(100vh - 64px)' }}>
         {children}
       </Box>
+
+      {assistantOpen && (
+        <Card
+          sx={{
+            position: 'fixed',
+            right: { xs: 12, sm: 24 },
+            bottom: { xs: 84, sm: 96 },
+            width: { xs: 'calc(100vw - 24px)', sm: 420 },
+            maxHeight: 'min(680px, calc(100vh - 128px))',
+            zIndex: 1300,
+            border: 1,
+            borderColor: 'divider',
+            boxShadow: 10,
+          }}
+        >
+          <CardContent sx={{ p: 0, display: 'flex', flexDirection: 'column', maxHeight: 'inherit' }}>
+            <Box sx={{ px: 2, py: 1.5, borderBottom: 1, borderColor: 'divider', display: 'flex', alignItems: 'center', gap: 1 }}>
+              <ChatIcon color="primary" />
+              <Box sx={{ flexGrow: 1 }}>
+                <Typography sx={{ fontWeight: 900 }}>Cloud Saver assistant</Typography>
+                <Typography variant="caption" color="text.secondary">Global across all orgs and accounts</Typography>
+              </Box>
+              <IconButton size="small" onClick={() => setAssistantOpen(false)} aria-label="close assistant">
+                <CloseIcon fontSize="small" />
+              </IconButton>
+            </Box>
+
+            <Stack spacing={1.25} sx={{ p: 2, overflow: 'auto', flexGrow: 1 }}>
+              {agentMessages.map((message, index) => (
+                <Box
+                  key={`${message.role}-${index}`}
+                  sx={{
+                    alignSelf: message.role === 'user' ? 'flex-end' : 'flex-start',
+                    maxWidth: '88%',
+                    px: 1.5,
+                    py: 1,
+                    borderRadius: 1,
+                    bgcolor: message.role === 'user' ? 'primary.main' : 'action.hover',
+                    color: message.role === 'user' ? 'primary.contrastText' : 'text.primary',
+                  }}
+                >
+                  <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>
+                    {message.content}
+                  </Typography>
+                </Box>
+              ))}
+            </Stack>
+
+            <Box sx={{ p: 1.5, borderTop: 1, borderColor: 'divider', display: 'flex', gap: 1 }}>
+              <TextField
+                value={chatInput}
+                onChange={(event) => setChatInput(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' && !event.shiftKey) {
+                    event.preventDefault();
+                    handleGlobalChatSubmit();
+                  }
+                }}
+                placeholder="Ask about your cloud estate"
+                fullWidth
+                size="small"
+              />
+              <Button
+                variant="contained"
+                onClick={handleGlobalChatSubmit}
+                disabled={chatting || !chatInput.trim()}
+                startIcon={chatting ? <CircularProgress color="inherit" size={16} /> : <SendIcon />}
+              >
+                Send
+              </Button>
+            </Box>
+          </CardContent>
+        </Card>
+      )}
+
+      <Button
+        variant="contained"
+        startIcon={<ChatIcon />}
+        onClick={() => setAssistantOpen((current) => !current)}
+        sx={{
+          position: 'fixed',
+          right: { xs: 12, sm: 24 },
+          bottom: { xs: 16, sm: 24 },
+          zIndex: 1301,
+          boxShadow: 8,
+          minHeight: 48,
+        }}
+      >
+        Assistant
+      </Button>
     </Box>
   );
 }

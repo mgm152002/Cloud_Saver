@@ -10,6 +10,7 @@ import CardContent from '@mui/material/CardContent';
 import CardActionArea from '@mui/material/CardActionArea';
 import Typography from '@mui/material/Typography';
 import Grid from '@mui/material/Grid';
+import Stack from '@mui/material/Stack';
 import Button from '@mui/material/Button';
 import CircularProgress from '@mui/material/CircularProgress';
 import Dialog from '@mui/material/Dialog';
@@ -19,12 +20,19 @@ import DialogTitle from '@mui/material/DialogTitle';
 import TextField from '@mui/material/TextField';
 import Alert from '@mui/material/Alert';
 import AddIcon from '@mui/icons-material/Add';
+import InsertChartIcon from '@mui/icons-material/InsertChart';
 
 interface Organization {
   id: string;
   name: string;
   plan: string;
+  accountCount?: number;
+  resourceCount?: number;
+  estimatedMonthlyCost?: number;
+  costByService?: { service: string; cost: number }[];
 }
+
+const preciseCurrency = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 });
 
 export default function Dashboard() {
   const [message, setMessage] = useState("");
@@ -151,6 +159,10 @@ export default function Dashboard() {
     return null;
   }
 
+  const maxOrgCost = Math.max(...orgs.map((org) => org.estimatedMonthlyCost ?? 0), 1);
+  const totalMonthlyCost = orgs.reduce((total, org) => total + (org.estimatedMonthlyCost ?? 0), 0);
+  const totalResources = orgs.reduce((total, org) => total + (org.resourceCount ?? 0), 0);
+
   const dashboardContent = (
     <Box sx={{ maxWidth: 1180, mx: 'auto', width: '100%' }}>
       <Box 
@@ -187,6 +199,73 @@ export default function Dashboard() {
 
       {error && (
         <Alert severity="error" sx={{ mb: 3 }}>{error}</Alert>
+      )}
+
+      {orgs.length > 0 && (
+        <Grid container spacing={2.5} sx={{ mb: 3 }}>
+          <Grid size={{ xs: 12, md: 4 }}>
+            <Card sx={{ border: 1, borderColor: 'divider', height: '100%' }}>
+              <CardContent sx={{ p: 2.5 }}>
+                <Typography variant="h4" sx={{ fontWeight: 900 }}>
+                  {preciseCurrency.format(totalMonthlyCost)}
+                </Typography>
+                <Typography color="text.secondary">Total estimated monthly cost</Typography>
+              </CardContent>
+            </Card>
+          </Grid>
+          <Grid size={{ xs: 12, md: 4 }}>
+            <Card sx={{ border: 1, borderColor: 'divider', height: '100%' }}>
+              <CardContent sx={{ p: 2.5 }}>
+                <Typography variant="h4" sx={{ fontWeight: 900 }}>
+                  {totalResources.toLocaleString()}
+                </Typography>
+                <Typography color="text.secondary">Tracked resources</Typography>
+              </CardContent>
+            </Card>
+          </Grid>
+          <Grid size={{ xs: 12, md: 4 }}>
+            <Card sx={{ border: 1, borderColor: 'divider', height: '100%' }}>
+              <CardContent sx={{ p: 2.5 }}>
+                <Typography variant="h4" sx={{ fontWeight: 900 }}>
+                  {orgs.reduce((total, org) => total + (org.accountCount ?? 0), 0).toLocaleString()}
+                </Typography>
+                <Typography color="text.secondary">Connected accounts</Typography>
+              </CardContent>
+            </Card>
+          </Grid>
+
+          <Grid size={12}>
+            <Card sx={{ border: 1, borderColor: 'divider' }}>
+              <CardContent sx={{ p: 3 }}>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 2 }}>
+                  <InsertChartIcon color="primary" />
+                  <Typography variant="h6" sx={{ fontWeight: 900 }}>
+                    Organization cost graph
+                  </Typography>
+                </Box>
+                <Stack spacing={1.5}>
+                  {orgs.map((org) => (
+                    <Box key={org.id}>
+                      <Box sx={{ display: 'flex', justifyContent: 'space-between', gap: 2, mb: 0.5 }}>
+                        <Typography sx={{ fontWeight: 800 }}>{org.name}</Typography>
+                        <Typography color="text.secondary">{preciseCurrency.format(org.estimatedMonthlyCost ?? 0)}</Typography>
+                      </Box>
+                      <Box sx={{ height: 12, bgcolor: 'action.hover', borderRadius: 1, overflow: 'hidden' }}>
+                        <Box
+                          sx={{
+                            height: '100%',
+                            width: `${Math.max(3, ((org.estimatedMonthlyCost ?? 0) / maxOrgCost) * 100)}%`,
+                            bgcolor: 'primary.main',
+                          }}
+                        />
+                      </Box>
+                    </Box>
+                  ))}
+                </Stack>
+              </CardContent>
+            </Card>
+          </Grid>
+        </Grid>
       )}
 
       {!loading && !error && (
@@ -231,6 +310,12 @@ export default function Dashboard() {
                       </Typography>
                       <Typography variant="body2" color="text.secondary">
                         Plan: {org.plan}
+                      </Typography>
+                      <Typography variant="body2" color="text.secondary">
+                        Cost: {preciseCurrency.format(org.estimatedMonthlyCost ?? 0)}
+                      </Typography>
+                      <Typography variant="body2" color="text.secondary">
+                        {org.accountCount ?? 0} accounts · {org.resourceCount ?? 0} resources
                       </Typography>
                     </CardContent>
                   </CardActionArea>

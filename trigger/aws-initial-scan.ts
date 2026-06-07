@@ -14,8 +14,12 @@ import { DescribeDBInstancesCommand, type DBInstance, type DescribeDBInstancesCo
 import { ListBucketsCommand, type Bucket, type ListBucketsCommandOutput, S3Client } from "@aws-sdk/client-s3";
 import { DescribeLoadBalancersCommand, type DescribeLoadBalancersCommandOutput, type LoadBalancer, ElasticLoadBalancingV2Client } from "@aws-sdk/client-elastic-load-balancing-v2";
 import { LambdaClient, ListFunctionsCommand, type FunctionConfiguration, type ListFunctionsCommandOutput } from "@aws-sdk/client-lambda";
+import { generateText, stepCountIs, tool } from "ai";
 import { and, eq } from "drizzle-orm";
+import { z } from "zod";
 import { validateAssumeRole } from "@/app/lib/aws-onboarding";
+import { createOpenRouterModel } from "@/app/lib/ai";
+import { estimateMonthlyCost, estimateResourceSavings, formatMoney } from "@/app/lib/cost-estimation";
 import { db } from "@/db/db";
 import { aiRecommendations, cloudAccounts, cloudResources, scanJobs } from "@/db/auth-schema";
 
@@ -37,15 +41,26 @@ type ScannedResource = {
   service: string;
   status?: string;
   utilization?: number;
+  monthlyCost?: number;
   metadata?: Record<string, unknown>;
 };
 
 type AiRecommendation = {
+  resourceId?: string;
   title: string;
   recommendation: string;
   estimatedSavings: number;
   severity: string;
   confidence: number;
+};
+
+type MetricSummary = {
+  metricName: string;
+  datapoints: number;
+  average?: number;
+  maximum?: number;
+  sum?: number;
+  latestTimestamp?: string;
 };
 
 function clientCredentials(credentials: AssumedCredentials) {
@@ -139,31 +154,265 @@ async function countS3Buckets(credentials: AssumedCredentials) {
   return response.Buckets ?? [];
 }
 
-async function getAverageEc2Cpu(region: string, credentials: AssumedCredentials, instanceId: string) {
-  const cloudwatch = new CloudWatchClient({ region, credentials: clientCredentials(credentials) });
+async function getS3BucketActivity(credentials: AssumedCredentials, bucketName: string) {
+  const cloudwatch = new CloudWatchClient({ region: "us-east-1", credentials: clientCredentials(credentials) });
   const endTime = new Date();
-  const startTime = new Date(endTime.getTime() - 14 * 24 * 60 * 60 * 1000);
-  const response = await cloudwatch.send(
+  const startTime = new Date(endTime.getTime() - 30 * 24 * 60 * 60 * 1000);
+
+  const requestMetricNames = ["AllRequests", "GetRequests", "PutRequests", "DeleteRequests"];
+  const requestResults = await Promise.all(
+    requestMetricNames.map(async (metricName) => {
+      const response = await cloudwatch.send(
+        new GetMetricStatisticsCommand({
+          Namespace: "AWS/S3",
+          MetricName: metricName,
+          Dimensions: [
+            { Name: "BucketName", Value: bucketName },
+            { Name: "FilterId", Value: "EntireBucket" },
+          ],
+          StartTime: startTime,
+          EndTime: endTime,
+          Period: 86400,
+          Statistics: ["Sum"],
+        }),
+      );
+
+      return {
+        metricName,
+        datapoints: response.Datapoints?.length ?? 0,
+        requests: response.Datapoints?.reduce((total, point) => total + (point.Sum ?? 0), 0) ?? 0,
+      };
+    }),
+  );
+
+  const storageResponse = await cloudwatch.send(
     new GetMetricStatisticsCommand({
-      Namespace: "AWS/EC2",
-      MetricName: "CPUUtilization",
-      Dimensions: [{ Name: "InstanceId", Value: instanceId }],
+      Namespace: "AWS/S3",
+      MetricName: "BucketSizeBytes",
+      Dimensions: [
+        { Name: "BucketName", Value: bucketName },
+        { Name: "StorageType", Value: "StandardStorage" },
+      ],
       StartTime: startTime,
       EndTime: endTime,
       Period: 86400,
-      Statistics: ["Average", "Maximum"],
+      Statistics: ["Average"],
+    }),
+  );
+
+  const latestStorage = [...(storageResponse.Datapoints ?? [])]
+    .sort((left, right) => (right.Timestamp?.getTime() ?? 0) - (left.Timestamp?.getTime() ?? 0))
+    .at(0);
+  const totalRequests = requestResults.reduce((total, metric) => total + metric.requests, 0);
+  const requestMetricDatapoints = requestResults.reduce((total, metric) => total + metric.datapoints, 0);
+
+  return {
+    lookbackDays: 30,
+    requestMetricsAvailable: requestMetricDatapoints > 0,
+    hasRecentRequests: requestMetricDatapoints > 0 ? totalRequests > 0 : undefined,
+    totalRequests,
+    requestMetrics: requestResults,
+    storageBytes: latestStorage?.Average ? Math.round(latestStorage.Average) : undefined,
+    storageMetricTimestamp: latestStorage?.Timestamp?.toISOString(),
+  };
+}
+
+async function getEc2MetricSummary(
+  cloudwatch: CloudWatchClient,
+  dimensions: { Name: string; Value: string }[],
+  metricName: string,
+  statistics: ("Average" | "Maximum" | "Sum")[],
+  startTime: Date,
+  endTime: Date,
+): Promise<MetricSummary> {
+  const response = await cloudwatch.send(
+    new GetMetricStatisticsCommand({
+      Namespace: "AWS/EC2",
+      MetricName: metricName,
+      Dimensions: dimensions,
+      StartTime: startTime,
+      EndTime: endTime,
+      Period: 86400,
+      Statistics: statistics,
     }),
   );
 
   const datapoints = response.Datapoints ?? [];
-  if (datapoints.length === 0) return undefined;
+  const averageValues = datapoints.map((point) => point.Average).filter((value): value is number => typeof value === "number");
+  const maximumValues = datapoints.map((point) => point.Maximum).filter((value): value is number => typeof value === "number");
+  const sumValues = datapoints.map((point) => point.Sum).filter((value): value is number => typeof value === "number");
 
-  const average = datapoints.reduce((total, point) => total + (point.Average ?? 0), 0) / datapoints.length;
-  const maximum = Math.max(...datapoints.map((point) => point.Maximum ?? 0));
   return {
-    average: Number(average.toFixed(2)),
-    maximum: Number(maximum.toFixed(2)),
+    metricName,
     datapoints: datapoints.length,
+    average: averageValues.length ? Number((averageValues.reduce((total, value) => total + value, 0) / averageValues.length).toFixed(2)) : undefined,
+    maximum: maximumValues.length ? Number(Math.max(...maximumValues).toFixed(2)) : undefined,
+    sum: sumValues.length ? Number(sumValues.reduce((total, value) => total + value, 0).toFixed(2)) : undefined,
+    latestTimestamp: [...datapoints].sort((left, right) => (right.Timestamp?.getTime() ?? 0) - (left.Timestamp?.getTime() ?? 0)).at(0)?.Timestamp?.toISOString(),
+  };
+}
+
+async function getEc2CloudWatchMetrics(region: string, credentials: AssumedCredentials, instanceId: string) {
+  const cloudwatch = new CloudWatchClient({ region, credentials: clientCredentials(credentials) });
+  const endTime = new Date();
+  const startTime = new Date(endTime.getTime() - 14 * 24 * 60 * 60 * 1000);
+
+  const [cpu, networkIn, networkOut, diskReadBytes, diskWriteBytes] = await Promise.all([
+    getEc2MetricSummary(cloudwatch, [{ Name: "InstanceId", Value: instanceId }], "CPUUtilization", ["Average", "Maximum"], startTime, endTime),
+    getEc2MetricSummary(cloudwatch, [{ Name: "InstanceId", Value: instanceId }], "NetworkIn", ["Sum"], startTime, endTime),
+    getEc2MetricSummary(cloudwatch, [{ Name: "InstanceId", Value: instanceId }], "NetworkOut", ["Sum"], startTime, endTime),
+    getEc2MetricSummary(cloudwatch, [{ Name: "InstanceId", Value: instanceId }], "DiskReadBytes", ["Sum"], startTime, endTime),
+    getEc2MetricSummary(cloudwatch, [{ Name: "InstanceId", Value: instanceId }], "DiskWriteBytes", ["Sum"], startTime, endTime),
+  ]);
+
+  return {
+    namespace: "AWS/EC2",
+    lookbackDays: 14,
+    enabled: cpu.datapoints > 0,
+    cpu,
+    networkIn,
+    networkOut,
+    diskReadBytes,
+    diskWriteBytes,
+  };
+}
+
+async function getAwsMetricSummary(
+  cloudwatch: CloudWatchClient,
+  namespace: string,
+  dimensions: { Name: string; Value: string }[],
+  metricName: string,
+  statistics: ("Average" | "Maximum" | "Sum")[],
+  startTime: Date,
+  endTime: Date,
+): Promise<MetricSummary> {
+  const response = await cloudwatch.send(
+    new GetMetricStatisticsCommand({
+      Namespace: namespace,
+      MetricName: metricName,
+      Dimensions: dimensions,
+      StartTime: startTime,
+      EndTime: endTime,
+      Period: 86400,
+      Statistics: statistics,
+    }),
+  );
+
+  const datapoints = response.Datapoints ?? [];
+  const averageValues = datapoints.map((point) => point.Average).filter((value): value is number => typeof value === "number");
+  const maximumValues = datapoints.map((point) => point.Maximum).filter((value): value is number => typeof value === "number");
+  const sumValues = datapoints.map((point) => point.Sum).filter((value): value is number => typeof value === "number");
+
+  return {
+    metricName,
+    datapoints: datapoints.length,
+    average: averageValues.length ? Number((averageValues.reduce((total, value) => total + value, 0) / averageValues.length).toFixed(2)) : undefined,
+    maximum: maximumValues.length ? Number(Math.max(...maximumValues).toFixed(2)) : undefined,
+    sum: sumValues.length ? Number(sumValues.reduce((total, value) => total + value, 0).toFixed(2)) : undefined,
+    latestTimestamp: [...datapoints].sort((left, right) => (right.Timestamp?.getTime() ?? 0) - (left.Timestamp?.getTime() ?? 0)).at(0)?.Timestamp?.toISOString(),
+  };
+}
+
+function metricWindow(days = 14) {
+  const endTime = new Date();
+  const startTime = new Date(endTime.getTime() - days * 24 * 60 * 60 * 1000);
+  return { startTime, endTime, days };
+}
+
+async function getEbsCloudWatchMetrics(region: string, credentials: AssumedCredentials, volumeId: string) {
+  const cloudwatch = new CloudWatchClient({ region, credentials: clientCredentials(credentials) });
+  const { startTime, endTime, days } = metricWindow(14);
+  const dimensions = [{ Name: "VolumeId", Value: volumeId }];
+  const [idleTime, readOps, writeOps, queueLength] = await Promise.all([
+    getAwsMetricSummary(cloudwatch, "AWS/EBS", dimensions, "VolumeIdleTime", ["Sum"], startTime, endTime),
+    getAwsMetricSummary(cloudwatch, "AWS/EBS", dimensions, "VolumeReadOps", ["Sum"], startTime, endTime),
+    getAwsMetricSummary(cloudwatch, "AWS/EBS", dimensions, "VolumeWriteOps", ["Sum"], startTime, endTime),
+    getAwsMetricSummary(cloudwatch, "AWS/EBS", dimensions, "VolumeQueueLength", ["Average", "Maximum"], startTime, endTime),
+  ]);
+
+  return {
+    namespace: "AWS/EBS",
+    lookbackDays: days,
+    enabled: idleTime.datapoints + readOps.datapoints + writeOps.datapoints > 0,
+    idleTime,
+    readOps,
+    writeOps,
+    queueLength,
+  };
+}
+
+async function getRdsCloudWatchMetrics(region: string, credentials: AssumedCredentials, dbInstanceIdentifier: string) {
+  const cloudwatch = new CloudWatchClient({ region, credentials: clientCredentials(credentials) });
+  const { startTime, endTime, days } = metricWindow(14);
+  const dimensions = [{ Name: "DBInstanceIdentifier", Value: dbInstanceIdentifier }];
+  const [cpu, databaseConnections, freeStorageSpace, readIops, writeIops] = await Promise.all([
+    getAwsMetricSummary(cloudwatch, "AWS/RDS", dimensions, "CPUUtilization", ["Average", "Maximum"], startTime, endTime),
+    getAwsMetricSummary(cloudwatch, "AWS/RDS", dimensions, "DatabaseConnections", ["Average", "Maximum"], startTime, endTime),
+    getAwsMetricSummary(cloudwatch, "AWS/RDS", dimensions, "FreeStorageSpace", ["Average"], startTime, endTime),
+    getAwsMetricSummary(cloudwatch, "AWS/RDS", dimensions, "ReadIOPS", ["Average", "Maximum"], startTime, endTime),
+    getAwsMetricSummary(cloudwatch, "AWS/RDS", dimensions, "WriteIOPS", ["Average", "Maximum"], startTime, endTime),
+  ]);
+
+  return {
+    namespace: "AWS/RDS",
+    lookbackDays: days,
+    enabled: cpu.datapoints + databaseConnections.datapoints > 0,
+    cpu,
+    databaseConnections,
+    freeStorageSpace,
+    readIops,
+    writeIops,
+  };
+}
+
+function loadBalancerDimension(loadBalancerArn?: string) {
+  return loadBalancerArn?.split(":loadbalancer/")[1];
+}
+
+async function getLoadBalancerCloudWatchMetrics(region: string, credentials: AssumedCredentials, loadBalancerArn: string) {
+  const loadBalancer = loadBalancerDimension(loadBalancerArn);
+  if (!loadBalancer) return undefined;
+
+  const cloudwatch = new CloudWatchClient({ region, credentials: clientCredentials(credentials) });
+  const { startTime, endTime, days } = metricWindow(14);
+  const dimensions = [{ Name: "LoadBalancer", Value: loadBalancer }];
+  const [requestCount, activeConnectionCount, targetResponseTime, consumedLcus] = await Promise.all([
+    getAwsMetricSummary(cloudwatch, "AWS/ApplicationELB", dimensions, "RequestCount", ["Sum"], startTime, endTime),
+    getAwsMetricSummary(cloudwatch, "AWS/ApplicationELB", dimensions, "ActiveConnectionCount", ["Sum"], startTime, endTime),
+    getAwsMetricSummary(cloudwatch, "AWS/ApplicationELB", dimensions, "TargetResponseTime", ["Average", "Maximum"], startTime, endTime),
+    getAwsMetricSummary(cloudwatch, "AWS/ApplicationELB", dimensions, "ConsumedLCUs", ["Sum"], startTime, endTime),
+  ]);
+
+  return {
+    namespace: "AWS/ApplicationELB",
+    lookbackDays: days,
+    enabled: requestCount.datapoints + activeConnectionCount.datapoints > 0,
+    requestCount,
+    activeConnectionCount,
+    targetResponseTime,
+    consumedLcus,
+  };
+}
+
+async function getLambdaCloudWatchMetrics(region: string, credentials: AssumedCredentials, functionName: string) {
+  const cloudwatch = new CloudWatchClient({ region, credentials: clientCredentials(credentials) });
+  const { startTime, endTime, days } = metricWindow(14);
+  const dimensions = [{ Name: "FunctionName", Value: functionName }];
+  const [invocations, errors, throttles, duration] = await Promise.all([
+    getAwsMetricSummary(cloudwatch, "AWS/Lambda", dimensions, "Invocations", ["Sum"], startTime, endTime),
+    getAwsMetricSummary(cloudwatch, "AWS/Lambda", dimensions, "Errors", ["Sum"], startTime, endTime),
+    getAwsMetricSummary(cloudwatch, "AWS/Lambda", dimensions, "Throttles", ["Sum"], startTime, endTime),
+    getAwsMetricSummary(cloudwatch, "AWS/Lambda", dimensions, "Duration", ["Average", "Maximum"], startTime, endTime),
+  ]);
+
+  return {
+    namespace: "AWS/Lambda",
+    lookbackDays: days,
+    enabled: invocations.datapoints + errors.datapoints + duration.datapoints > 0,
+    invocations,
+    errors,
+    throttles,
+    duration,
   };
 }
 
@@ -171,9 +420,18 @@ function getNameTag(tags?: { Key?: string; Value?: string }[]) {
   return tags?.find((tag) => tag.Key === "Name")?.Value;
 }
 
+function parseJsonObject(text: string) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    const match = text.match(/\{[\s\S]*\}/);
+    return match ? JSON.parse(match[0]) : {};
+  }
+}
+
 async function buildRecommendations(resources: ScannedResource[], counts: Record<string, number>) {
-  const apiKey = process.env.OPENROUTER_API_KEY;
-  if (!apiKey || resources.length === 0) return [];
+  const model = createOpenRouterModel();
+  if (!model || resources.length === 0) return [];
 
   const promptResources = resources.slice(0, 80).map((resource) => ({
     id: resource.resourceId,
@@ -183,49 +441,100 @@ async function buildRecommendations(resources: ScannedResource[], counts: Record
     region: resource.region,
     status: resource.status,
     utilization: resource.utilization,
+    monthlyCost: resource.monthlyCost,
     metadata: resource.metadata,
   }));
 
-  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-      "HTTP-Referer": "http://localhost:3000",
-      "X-Title": "Cloud Saver",
+  const totalMonthlyCost = formatMoney(resources.reduce((total, resource) => total + (resource.monthlyCost ?? 0), 0));
+  if (totalMonthlyCost <= 0) return [];
+
+  const result = await generateText({
+    model,
+    stopWhen: stepCountIs(4),
+    tools: {
+      summarizeInventory: tool({
+        description: "Get AWS inventory counts and estimated monthly cost totals from the scanner.",
+        inputSchema: z.object({}),
+        execute: async () => ({
+          counts,
+          totalMonthlyCost,
+          topCostResources: [...resources]
+            .sort((left, right) => (right.monthlyCost ?? 0) - (left.monthlyCost ?? 0))
+            .slice(0, 12)
+            .map((resource) => ({
+              id: resource.resourceId,
+              name: resource.resourceName,
+              type: resource.resourceType,
+              service: resource.service,
+              region: resource.region,
+              status: resource.status,
+              utilization: resource.utilization,
+              monthlyCost: resource.monthlyCost,
+              metadata: resource.metadata,
+            })),
+        }),
+      }),
+      estimateSavings: tool({
+        description: "Estimate conservative monthly savings for a scanned AWS resource by resource id.",
+        inputSchema: z.object({
+          resourceId: z.string(),
+          action: z.string().describe("The proposed cost optimization action."),
+        }),
+        execute: async ({ resourceId }) => {
+          const resource = resources.find((candidate) => candidate.resourceId === resourceId);
+          if (!resource) return { resourceId, estimatedSavings: 0, reason: "Resource was not found in this scan." };
+          return {
+            resourceId,
+            monthlyCost: resource.monthlyCost ?? 0,
+            estimatedSavings: formatMoney(estimateResourceSavings(resource, resource.monthlyCost ?? 0)),
+            s3Activity: resource.metadata?.s3Activity,
+          };
+        },
+      }),
     },
-    body: JSON.stringify({
-      model: process.env.OPENROUTER_MODEL ?? "openai/gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are a cloud cost optimization assistant. Return only valid JSON with a recommendations array. Do not invent exact costs; estimate conservatively from resource type, status, and utilization metrics.",
-        },
-        {
-          role: "user",
-          content: JSON.stringify({
-            instruction:
-              "Create up to 6 AWS cost-saving recommendations. Include title, recommendation, estimatedSavings monthly USD number, severity low/medium/high, confidence 0-100.",
-            counts,
-            resources: promptResources,
-          }),
-        },
-      ],
-      response_format: { type: "json_object" },
+    system:
+      "You are a cloud cost optimization assistant. Use the provided tools before finalizing recommendations. Return only valid JSON with a recommendations array. Never invent exact AWS bills; ground savings in scanned monthlyCost, status, utilization, and metadata. For EC2, EBS, RDS, load balancers, and Lambda, require metadata.cloudWatchMetrics.enabled=true before recommending rightsizing, deletion, stopping, or scheduling. If required CloudWatch metrics are missing, recommend enabling or validating metrics instead of taking action. For S3 buckets, do not recommend deletion unless metadata.s3Activity.requestMetricsAvailable is true and metadata.s3Activity.hasRecentRequests is false.",
+    prompt: JSON.stringify({
+      instruction:
+        "Create up to 6 AWS cost-saving recommendations. Include resourceId, title, recommendation, estimatedSavings monthly USD number, severity low/medium/high, confidence 0-100. Prefer idle unattached volumes, EC2 instances with CloudWatch CPU average under 8% and maximum under 25%, RDS instances with low CPU and near-zero connections, load balancers with zero RequestCount, and Lambda functions with zero Invocations. Use metadata.cloudWatchMetrics for EC2/EBS/RDS/ELB/Lambda and never recommend rightsizing/deleting/stopping these resources when metrics are missing. For S3, use CloudWatch AWS/S3 request metrics from metadata.s3Activity; if request metrics are unavailable, recommend enabling S3 request metrics or server access logging instead of deleting the bucket. Call summarizeInventory and estimateSavings for recommendations tied to specific resources.",
+      counts,
+      totalMonthlyCost,
+      resources: promptResources,
     }),
   });
 
-  if (!response.ok) {
-    throw new Error(`OpenRouter recommendation request failed: ${response.status}`);
-  }
+  const parsed = parseJsonObject(result.text) as { recommendations?: AiRecommendation[] };
+  return (parsed.recommendations ?? [])
+    .filter((recommendation) => {
+      const text = `${recommendation.title} ${recommendation.recommendation}`.toLowerCase();
+      const resource = resources.find(
+        (candidate) =>
+          candidate.resourceId === recommendation.resourceId ||
+          text.includes(candidate.resourceId.toLowerCase()) ||
+          (candidate.resourceName && text.includes(candidate.resourceName.toLowerCase())),
+      );
+      const isS3Delete = resource?.resourceType === "s3-bucket" && /\b(delete|remove|terminate)\b/.test(text);
+      if (!isS3Delete) return true;
 
-  const data = await response.json() as { choices?: { message?: { content?: string } }[] };
-  const content = data.choices?.[0]?.message?.content;
-  if (!content) return [];
+      const activity = resource?.metadata?.s3Activity as { requestMetricsAvailable?: boolean; hasRecentRequests?: boolean } | undefined;
+      return activity?.requestMetricsAvailable === true && activity.hasRecentRequests === false;
+    })
+    .filter((recommendation) => {
+      const text = `${recommendation.title} ${recommendation.recommendation}`.toLowerCase();
+      const resource = resources.find(
+        (candidate) =>
+          candidate.resourceType === "ec2-instance" &&
+          (candidate.resourceId === recommendation.resourceId ||
+            text.includes(candidate.resourceId.toLowerCase()) ||
+            Boolean(candidate.resourceName && text.includes(candidate.resourceName.toLowerCase()))),
+      );
+      const isEc2Optimization = Boolean(resource) && /\b(rightsize|resize|downsize|stop|terminate|delete|schedule|reserved|savings plan)\b/.test(text);
+      if (!isEc2Optimization) return true;
 
-  const parsed = JSON.parse(content) as { recommendations?: AiRecommendation[] };
-  return parsed.recommendations?.slice(0, 6) ?? [];
+      const metrics = resource?.metadata?.cloudWatchMetrics as { enabled?: boolean; cpu?: { datapoints?: number; average?: number; maximum?: number } } | undefined;
+      return metrics?.enabled === true && Boolean(metrics.cpu?.datapoints) && Number(metrics.cpu?.average ?? 100) < 8 && Number(metrics.cpu?.maximum ?? 100) < 25;
+    })
+    .slice(0, 6);
 }
 
 export const awsInitialScan = task({
@@ -262,13 +571,20 @@ export const awsInitialScan = task({
       counts.s3Buckets = buckets.length;
       for (const bucket of buckets) {
         if (!bucket.Name) continue;
+        const s3Activity = await getS3BucketActivity(credentials, bucket.Name).catch((error: unknown) => {
+          regionErrors.s3 = [
+            ...(regionErrors.s3 ?? []),
+            `${bucket.Name}: ${error instanceof Error ? error.message : "CloudWatch S3 metrics failed"}`,
+          ];
+          return undefined;
+        });
         resources.push({
           resourceId: bucket.Name,
           resourceName: bucket.Name,
           resourceType: "s3-bucket",
           service: "s3",
           region: "global",
-          metadata: { creationDate: bucket.CreationDate?.toISOString() },
+          metadata: { creationDate: bucket.CreationDate?.toISOString(), s3Activity },
         });
       }
 
@@ -284,7 +600,11 @@ export const awsInitialScan = task({
 
         for (const instance of ec2Counts.instances) {
           if (!instance.InstanceId) continue;
-          const cpu = await getAverageEc2Cpu(region, credentials, instance.InstanceId).catch(() => undefined);
+          const cloudWatchMetrics = await getEc2CloudWatchMetrics(region, credentials, instance.InstanceId).catch((error: unknown) => {
+            errors.push(`cloudwatch/ec2/${instance.InstanceId}: ${error instanceof Error ? error.message : "metrics failed"}`);
+            return undefined;
+          });
+          const cpu = cloudWatchMetrics?.cpu;
           resources.push({
             resourceId: instance.InstanceId,
             resourceName: getNameTag(instance.Tags),
@@ -292,10 +612,11 @@ export const awsInitialScan = task({
             region,
             service: "ec2",
             status: instance.State?.Name,
-            utilization: cpu?.average,
+            utilization: cloudWatchMetrics?.enabled ? cpu?.average : undefined,
             metadata: {
               instanceType: instance.InstanceType,
               launchTime: instance.LaunchTime?.toISOString(),
+              cloudWatchMetrics,
               cpu,
             },
           });
@@ -303,6 +624,10 @@ export const awsInitialScan = task({
 
         for (const volume of ec2Counts.volumes) {
           if (!volume.VolumeId) continue;
+          const cloudWatchMetrics = await getEbsCloudWatchMetrics(region, credentials, volume.VolumeId).catch((error: unknown) => {
+            errors.push(`cloudwatch/ebs/${volume.VolumeId}: ${error instanceof Error ? error.message : "metrics failed"}`);
+            return undefined;
+          });
           resources.push({
             resourceId: volume.VolumeId,
             resourceType: "ec2-volume",
@@ -313,6 +638,7 @@ export const awsInitialScan = task({
               size: volume.Size,
               volumeType: volume.VolumeType,
               attachments: volume.Attachments?.length ?? 0,
+              cloudWatchMetrics,
             },
           });
         }
@@ -324,6 +650,12 @@ export const awsInitialScan = task({
         counts.rdsInstances += rdsInstances.length;
         for (const dbInstance of rdsInstances) {
           if (!dbInstance.DBInstanceArn && !dbInstance.DBInstanceIdentifier) continue;
+          const cloudWatchMetrics = dbInstance.DBInstanceIdentifier
+            ? await getRdsCloudWatchMetrics(region, credentials, dbInstance.DBInstanceIdentifier).catch((error: unknown) => {
+                errors.push(`cloudwatch/rds/${dbInstance.DBInstanceIdentifier}: ${error instanceof Error ? error.message : "metrics failed"}`);
+                return undefined;
+              })
+            : undefined;
           resources.push({
             resourceId: dbInstance.DBInstanceArn ?? dbInstance.DBInstanceIdentifier!,
             resourceName: dbInstance.DBInstanceIdentifier,
@@ -336,6 +668,7 @@ export const awsInitialScan = task({
               engine: dbInstance.Engine,
               allocatedStorage: dbInstance.AllocatedStorage,
               multiAZ: dbInstance.MultiAZ,
+              cloudWatchMetrics,
             },
           });
         }
@@ -347,6 +680,10 @@ export const awsInitialScan = task({
         counts.loadBalancers += loadBalancers.length;
         for (const loadBalancer of loadBalancers) {
           if (!loadBalancer.LoadBalancerArn) continue;
+          const cloudWatchMetrics = await getLoadBalancerCloudWatchMetrics(region, credentials, loadBalancer.LoadBalancerArn).catch((error: unknown) => {
+            errors.push(`cloudwatch/elb/${loadBalancer.LoadBalancerName ?? loadBalancer.LoadBalancerArn}: ${error instanceof Error ? error.message : "metrics failed"}`);
+            return undefined;
+          });
           resources.push({
             resourceId: loadBalancer.LoadBalancerArn,
             resourceName: loadBalancer.LoadBalancerName,
@@ -357,6 +694,7 @@ export const awsInitialScan = task({
             metadata: {
               type: loadBalancer.Type,
               scheme: loadBalancer.Scheme,
+              cloudWatchMetrics,
             },
           });
         }
@@ -368,6 +706,12 @@ export const awsInitialScan = task({
         counts.lambdaFunctions += functions.length;
         for (const fn of functions) {
           if (!fn.FunctionArn && !fn.FunctionName) continue;
+          const cloudWatchMetrics = fn.FunctionName
+            ? await getLambdaCloudWatchMetrics(region, credentials, fn.FunctionName).catch((error: unknown) => {
+                errors.push(`cloudwatch/lambda/${fn.FunctionName}: ${error instanceof Error ? error.message : "metrics failed"}`);
+                return undefined;
+              })
+            : undefined;
           resources.push({
             resourceId: fn.FunctionArn ?? fn.FunctionName!,
             resourceName: fn.FunctionName,
@@ -380,6 +724,7 @@ export const awsInitialScan = task({
               memorySize: fn.MemorySize,
               codeSize: fn.CodeSize,
               lastModified: fn.LastModified,
+              cloudWatchMetrics,
             },
           });
         }
@@ -390,6 +735,10 @@ export const awsInitialScan = task({
       }
 
       const resourcesFound = Object.values(counts).reduce((total, count) => total + count, 0);
+      for (const resource of resources) {
+        resource.monthlyCost = formatMoney(estimateMonthlyCost(resource));
+      }
+      const estimatedMonthlyCost = formatMoney(resources.reduce((total, resource) => total + (resource.monthlyCost ?? 0), 0));
 
       const completedAt = new Date();
 
@@ -414,6 +763,7 @@ export const awsInitialScan = task({
             region: resource.region,
             service: resource.service,
             status: resource.status,
+            monthlyCost: String(resource.monthlyCost ?? 0),
             utilization: typeof resource.utilization === "number" ? String(resource.utilization) : undefined,
             metadata: resource.metadata,
             firstSeenAt: completedAt,
@@ -450,6 +800,7 @@ export const awsInitialScan = task({
           scanMetadata: {
             regions,
             counts,
+            estimatedMonthlyCost,
             resourcesStored: resources.length,
             recommendationsCreated: recommendations.length,
             regionErrors,
@@ -471,6 +822,7 @@ export const awsInitialScan = task({
         status: "completed",
         scanJobId: scanJob.id,
         resourcesFound,
+        estimatedMonthlyCost,
         counts,
         recommendationsCreated: recommendations.length,
       };
