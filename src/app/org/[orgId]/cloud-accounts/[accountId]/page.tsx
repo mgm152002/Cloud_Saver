@@ -10,6 +10,10 @@ import {
   CardContent,
   Chip,
   CircularProgress,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
   Grid,
   Stack,
   Divider,
@@ -33,6 +37,9 @@ import DoneIcon from "@mui/icons-material/Done";
 import CloseIcon from "@mui/icons-material/Close";
 import InsertChartIcon from "@mui/icons-material/InsertChart";
 import SettingsSuggestIcon from "@mui/icons-material/SettingsSuggest";
+import HistoryIcon from "@mui/icons-material/History";
+import LocalOfferIcon from "@mui/icons-material/LocalOffer";
+import EditIcon from "@mui/icons-material/Edit";
 import DashboardLayout from "../../../../../components/dashboard-layout";
 
 interface CloudAccount {
@@ -61,6 +68,7 @@ interface CloudResource {
   status: string | null;
   utilization: string | null;
   monthlyCost: string | null;
+  tags: Record<string, string> | null;
   metadata: Record<string, unknown> | null;
   lastSeenAt: string | null;
 }
@@ -140,6 +148,10 @@ function formatValue(value: unknown) {
   return String(value);
 }
 
+function tagsToText(tags: Record<string, string> | null) {
+  return JSON.stringify(tags ?? {}, null, 2);
+}
+
 function getMetricGap(resource: CloudResource): MetricGap | null {
   const metadata = resource.metadata as {
     s3Activity?: { requestMetricsAvailable?: boolean };
@@ -204,7 +216,11 @@ export default function CostDashboardPage() {
   const [refreshing, setRefreshing] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [savingPolicy, setSavingPolicy] = useState(false);
+  const [savingTags, setSavingTags] = useState(false);
   const [actingRecommendationId, setActingRecommendationId] = useState<string | null>(null);
+  const [actingPlanId, setActingPlanId] = useState<string | null>(null);
+  const [tagResource, setTagResource] = useState<CloudResource | null>(null);
+  const [tagText, setTagText] = useState("{}");
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
   const [policyForm, setPolicyForm] = useState({
@@ -384,6 +400,69 @@ export default function CostDashboardPage() {
     }
   };
 
+  const openTagEditor = (resource: CloudResource) => {
+    setTagResource(resource);
+    setTagText(tagsToText(resource.tags));
+    setError("");
+    setSuccess("");
+  };
+
+  const handleSaveTags = async () => {
+    if (!tagResource) return;
+
+    setSavingTags(true);
+    setError("");
+    setSuccess("");
+
+    try {
+      const parsed = JSON.parse(tagText) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("Tags must be a JSON object, for example {\"owner\":\"platform\"}.");
+      }
+
+      const response = await fetch(`/api/org/${orgId}/cloud-accounts/${accountId}/resources/${tagResource.id}/tags`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tags: parsed }),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.message || "Failed to save tags");
+      }
+
+      setResources((current) => current.map((resource) => (resource.id === tagResource.id ? data.resource : resource)));
+      setTagResource(null);
+      setSuccess("Resource tags saved.");
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Failed to save tags");
+    } finally {
+      setSavingTags(false);
+    }
+  };
+
+  const handleActionPlanDone = async (planId: string) => {
+    setActingPlanId(planId);
+    setError("");
+    setSuccess("");
+
+    try {
+      const response = await fetch(`/api/org/${orgId}/cloud-accounts/${accountId}/action-plans/${planId}/done`, {
+        method: "POST",
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.message || "Failed to mark action plan done");
+      }
+
+      setActionPlans((current) => current.filter((plan) => plan.id !== planId));
+      setSuccess("Action plan marked done.");
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Failed to mark action plan done");
+    } finally {
+      setActingPlanId(null);
+    }
+  };
+
   const resourcesFound = resources.length || account?.latestScanJob?.resourcesFound || 0;
   const estimatedMonthlyCost = useMemo(
     () => resources.reduce((total, resource) => total + Number(resource.monthlyCost ?? 0), 0),
@@ -474,6 +553,13 @@ export default function CostDashboardPage() {
                   variant="outlined"
                 >
                   {refreshing ? "Refreshing" : "Refresh"}
+                </Button>
+                <Button
+                  onClick={() => router.push(`/org/${orgId}/cloud-accounts/${accountId}/history`)}
+                  startIcon={<HistoryIcon />}
+                  variant="outlined"
+                >
+                  History
                 </Button>
                 <Button
                   disabled={scanning}
@@ -827,11 +913,22 @@ export default function CostDashboardPage() {
                                 {plan.executionPlan?.resourceName || plan.executionPlan?.resourceId || "Resource pending review"}
                               </Typography>
                             </Box>
-                            <Chip
-                              label={plan.actionType?.replaceAll("_", " ") || "plan"}
-                              size="small"
-                              color={plan.actionType === "ec2_rightsize_instance" ? "primary" : "default"}
-                            />
+                            <Stack direction="row" spacing={1} sx={{ flexWrap: "wrap", rowGap: 1, justifyContent: "flex-end" }}>
+                              <Chip
+                                label={plan.actionType?.replaceAll("_", " ") || "plan"}
+                                size="small"
+                                color={plan.actionType === "ec2_rightsize_instance" ? "primary" : "default"}
+                              />
+                              <Button
+                                disabled={Boolean(actingPlanId)}
+                                onClick={() => handleActionPlanDone(plan.id)}
+                                size="small"
+                                startIcon={actingPlanId === plan.id ? <CircularProgress color="inherit" size={14} /> : <DoneIcon />}
+                                variant="contained"
+                              >
+                                Done
+                              </Button>
+                            </Stack>
                           </Box>
 
                           <Typography color="text.secondary" sx={{ mb: 2 }}>
@@ -974,21 +1071,78 @@ export default function CostDashboardPage() {
                         <Typography color="text.secondary">
                           {resource.service} · {resource.resourceType}
                         </Typography>
-                        <Typography color="text.secondary">
-                          {resource.region || "global"}
-                        </Typography>
+                        <Box>
+                          <Typography color="text.secondary">
+                            {resource.region || "global"}
+                          </Typography>
+                          <Box sx={{ display: "flex", gap: 0.5, flexWrap: "wrap", mt: 0.75 }}>
+                            {Object.entries(resource.tags ?? {}).slice(0, 3).map(([key, value]) => (
+                              <Chip
+                                key={`${resource.id}-${key}`}
+                                icon={<LocalOfferIcon />}
+                                label={`${key}: ${value}`}
+                                size="small"
+                                variant="outlined"
+                              />
+                            ))}
+                            {Object.keys(resource.tags ?? {}).length > 3 && (
+                              <Chip label={`+${Object.keys(resource.tags ?? {}).length - 3}`} size="small" variant="outlined" />
+                            )}
+                          </Box>
+                        </Box>
                         <Typography sx={{ fontWeight: 800 }}>
                           {preciseCurrency.format(Number(resource.monthlyCost ?? 0))}/mo
                         </Typography>
-                        <Typography color="text.secondary">
-                          {resource.utilization ? `${resource.utilization}% avg CPU` : resource.status || "tracked"}
-                        </Typography>
+                        <Box>
+                          <Typography color="text.secondary">
+                            {resource.utilization ? `${resource.utilization}% avg CPU` : resource.status || "tracked"}
+                          </Typography>
+                          <Button
+                            onClick={() => openTagEditor(resource)}
+                            size="small"
+                            startIcon={<EditIcon />}
+                            sx={{ mt: 0.75 }}
+                            variant="text"
+                          >
+                            Tags
+                          </Button>
+                        </Box>
                       </Box>
                     ))}
                   </Stack>
                 )}
               </CardContent>
             </Card>
+
+            <Dialog open={Boolean(tagResource)} onClose={() => setTagResource(null)} maxWidth="sm" fullWidth>
+              <DialogTitle>Edit resource tags</DialogTitle>
+              <DialogContent>
+                <Typography variant="body2" color="text.secondary" sx={{ mb: 2, overflowWrap: "anywhere" }}>
+                  {tagResource?.resourceName || tagResource?.resourceId}
+                </Typography>
+                <TextField
+                  value={tagText}
+                  onChange={(event) => setTagText(event.target.value)}
+                  fullWidth
+                  multiline
+                  minRows={8}
+                  sx={{ fontFamily: "var(--font-geist-mono)" }}
+                />
+              </DialogContent>
+              <DialogActions>
+                <Button onClick={() => setTagResource(null)} disabled={savingTags}>
+                  Cancel
+                </Button>
+                <Button
+                  onClick={handleSaveTags}
+                  disabled={savingTags}
+                  startIcon={savingTags ? <CircularProgress color="inherit" size={16} /> : <LocalOfferIcon />}
+                  variant="contained"
+                >
+                  {savingTags ? "Saving" : "Save tags"}
+                </Button>
+              </DialogActions>
+            </Dialog>
           </>
         )}
       </Box>

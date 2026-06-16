@@ -5,6 +5,7 @@ import {
   alerts,
   cloudAccounts,
   cloudResources,
+  jobHistory,
   organizations,
   resourceCostHistory,
   scanJobs,
@@ -239,6 +240,7 @@ export async function DELETE(
   }
 
   await db.delete(usagePolicies).where(and(eq(usagePolicies.cloudAccountId, accountId), eq(usagePolicies.organizationId, orgId)));
+  await db.delete(jobHistory).where(and(eq(jobHistory.cloudAccountId, accountId), eq(jobHistory.organizationId, orgId)));
   await db.delete(scanJobs).where(and(eq(scanJobs.cloudAccountId, accountId), eq(scanJobs.organizationId, orgId)));
   await db.delete(cloudAccounts).where(eq(cloudAccounts.id, accountId));
 

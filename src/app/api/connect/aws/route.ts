@@ -7,7 +7,7 @@ import {
   validateAssumeRole,
   type AwsCredentialsMetadata,
 } from "@/app/lib/aws-onboarding";
-import { cloudAccounts, organizations } from "@/db/auth-schema";
+import { cloudAccounts, jobHistory, organizations } from "@/db/auth-schema";
 import { db } from "@/db/db";
 import { tasks } from "@trigger.dev/sdk/v3";
 import { and, desc, eq } from "drizzle-orm";
@@ -137,6 +137,20 @@ export async function POST(request: Request) {
       roleArn,
       externalId,
       region: "ap-south-1",
+    });
+
+    await db.insert(jobHistory).values({
+      organizationId: body.orgId,
+      cloudAccountId: pendingAccount.id,
+      triggerRunId: triggerHandle.id,
+      taskIdentifier: "aws-initial-scan",
+      jobType: "aws_inventory_scan",
+      status: "queued",
+      message: "Initial AWS inventory scan queued in Trigger.dev.",
+      metadata: {
+        provider: "aws",
+        accountIdentifier: accountId,
+      },
     });
 
     const credentials: AwsCredentialsMetadata = {

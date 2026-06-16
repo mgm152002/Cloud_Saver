@@ -121,6 +121,27 @@ export const scanJobs = pgTable("scan_jobs", {
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
+export const jobHistory = pgTable("job_history", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  organizationId: uuid("organization_id")
+    .references(() => organizations.id)
+    .notNull(),
+  cloudAccountId: uuid("cloud_account_id")
+    .references(() => cloudAccounts.id)
+    .notNull(),
+  scanJobId: uuid("scan_job_id").references(() => scanJobs.id),
+  triggerRunId: varchar("trigger_run_id", { length: 255 }),
+  taskIdentifier: varchar("task_identifier", { length: 255 }).notNull(),
+  jobType: varchar("job_type", { length: 100 }).notNull(),
+  status: varchar("status", { length: 50 }).default("queued").notNull(),
+  message: text("message"),
+  resourcesFound: integer("resources_found"),
+  startedAt: timestamp("started_at"),
+  completedAt: timestamp("completed_at"),
+  metadata: jsonb("metadata"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
 export const cloudResources = pgTable("cloud_resources", {
   id: uuid("id").defaultRandom().primaryKey(),
   organizationId: uuid("organization_id")
@@ -263,6 +284,7 @@ export const organizationRelations = relations(organizations, ({ one, many }) =>
   }),
   cloudAccounts: many(cloudAccounts),
   scanJobs: many(scanJobs),
+  jobHistory: many(jobHistory),
   cloudResources: many(cloudResources),
   aiRecommendations: many(aiRecommendations),
   aiRemediations: many(aiRemediations),
@@ -277,6 +299,7 @@ export const cloudAccountsRelations = relations(cloudAccounts, ({ one, many }) =
     references: [organizations.id],
   }),
   scanJobs: many(scanJobs),
+  jobHistory: many(jobHistory),
   cloudResources: many(cloudResources),
 }));
 
@@ -288,6 +311,21 @@ export const scanJobsRelations = relations(scanJobs, ({ one }) => ({
   cloudAccount: one(cloudAccounts, {
     fields: [scanJobs.cloudAccountId],
     references: [cloudAccounts.id],
+  }),
+}));
+
+export const jobHistoryRelations = relations(jobHistory, ({ one }) => ({
+  organization: one(organizations, {
+    fields: [jobHistory.organizationId],
+    references: [organizations.id],
+  }),
+  cloudAccount: one(cloudAccounts, {
+    fields: [jobHistory.cloudAccountId],
+    references: [cloudAccounts.id],
+  }),
+  scanJob: one(scanJobs, {
+    fields: [jobHistory.scanJobId],
+    references: [scanJobs.id],
   }),
 }));
 

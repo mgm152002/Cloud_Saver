@@ -20,6 +20,7 @@ import CloudIcon from '@mui/icons-material/Cloud';
 import AddIcon from '@mui/icons-material/Add';
 import DeleteIcon from '@mui/icons-material/Delete';
 import RefreshIcon from '@mui/icons-material/Refresh';
+import HistoryIcon from '@mui/icons-material/History';
 import Chip from '@mui/material/Chip';
 
 interface CloudAccount {
@@ -321,20 +322,32 @@ export default function OrgDetailPage() {
                   <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1 }}>
                     Added: {new Date(account.createdAt).toLocaleDateString()}
                   </Typography>
-                  <Button
-                    color="error"
-                    disabled={deletingAccountId === account.id}
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      setDeleteTarget(account);
-                    }}
-                    size="small"
-                    startIcon={<DeleteIcon fontSize="small" />}
-                    sx={{ mt: 2 }}
-                    variant="outlined"
-                  >
-                    Delete
-                  </Button>
+                  <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', mt: 2 }}>
+                    <Button
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        router.push(`/org/${orgId}/cloud-accounts/${account.id}/history`);
+                      }}
+                      size="small"
+                      startIcon={<HistoryIcon fontSize="small" />}
+                      variant="outlined"
+                    >
+                      History
+                    </Button>
+                    <Button
+                      color="error"
+                      disabled={deletingAccountId === account.id}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        setDeleteTarget(account);
+                      }}
+                      size="small"
+                      startIcon={<DeleteIcon fontSize="small" />}
+                      variant="outlined"
+                    >
+                      Delete
+                    </Button>
+                  </Box>
                 </CardContent>
               </Card>
             ))}

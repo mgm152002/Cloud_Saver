@@ -14,6 +14,7 @@ import { DescribeDBInstancesCommand, type DBInstance, type DescribeDBInstancesCo
 import { ListBucketsCommand, type Bucket, type ListBucketsCommandOutput, S3Client } from "@aws-sdk/client-s3";
 import { DescribeLoadBalancersCommand, type DescribeLoadBalancersCommandOutput, type LoadBalancer, ElasticLoadBalancingV2Client } from "@aws-sdk/client-elastic-load-balancing-v2";
 import { LambdaClient, ListFunctionsCommand, type FunctionConfiguration, type ListFunctionsCommandOutput } from "@aws-sdk/client-lambda";
+import { CloudWatchLogsClient, DescribeLogGroupsCommand } from "@aws-sdk/client-cloudwatch-logs";
 import { generateText, stepCountIs, tool } from "ai";
 import { and, eq } from "drizzle-orm";
 import { z } from "zod";
@@ -21,7 +22,7 @@ import { validateAssumeRole } from "@/app/lib/aws-onboarding";
 import { createOpenRouterModel } from "@/app/lib/ai";
 import { estimateMonthlyCost, estimateResourceSavings, formatMoney } from "@/app/lib/cost-estimation";
 import { db } from "@/db/db";
-import { aiRecommendations, cloudAccounts, cloudResources, scanJobs } from "@/db/auth-schema";
+import { aiRecommendations, cloudAccounts, cloudResources, jobHistory, scanJobs } from "@/db/auth-schema";
 
 type AwsInitialScanPayload = {
   organizationId: string;
@@ -29,6 +30,7 @@ type AwsInitialScanPayload = {
   roleArn: string;
   externalId: string;
   region?: string;
+  triggerRunId?: string;
 };
 
 type AssumedCredentials = Awaited<ReturnType<typeof validateAssumeRole>>;
@@ -42,6 +44,7 @@ type ScannedResource = {
   status?: string;
   utilization?: number;
   monthlyCost?: number;
+  tags?: Record<string, string>;
   metadata?: Record<string, unknown>;
 };
 
@@ -420,6 +423,65 @@ function getNameTag(tags?: { Key?: string; Value?: string }[]) {
   return tags?.find((tag) => tag.Key === "Name")?.Value;
 }
 
+function awsTagsToRecord(tags?: { Key?: string; Value?: string }[]) {
+  return Object.fromEntries(
+    (tags ?? [])
+      .filter((tag): tag is { Key: string; Value: string } => Boolean(tag.Key && tag.Value))
+      .map((tag) => [tag.Key, tag.Value]),
+  );
+}
+
+async function getLogGroupSummary(region: string, credentials: AssumedCredentials, logGroupNamePrefix: string) {
+  const logs = new CloudWatchLogsClient({ region, credentials: clientCredentials(credentials) });
+  const response = await logs.send(
+    new DescribeLogGroupsCommand({
+      logGroupNamePrefix,
+      limit: 1,
+    }),
+  );
+  const logGroup = response.logGroups?.find((candidate) => candidate.logGroupName === logGroupNamePrefix) ?? response.logGroups?.[0];
+  if (!logGroup) return undefined;
+
+  return {
+    logGroupName: logGroup.logGroupName,
+    storedBytes: logGroup.storedBytes,
+    retentionInDays: logGroup.retentionInDays,
+    creationTime: logGroup.creationTime ? new Date(logGroup.creationTime).toISOString() : undefined,
+  };
+}
+
+async function buildAiTags(resources: ScannedResource[]) {
+  const model = createOpenRouterModel();
+  if (!model || resources.length === 0) return new Map<string, Record<string, string>>();
+
+  const result = await generateText({
+    model,
+    system:
+      "You generate concise cloud resource tags from AWS inventory metadata and CloudWatch Logs/metrics signals. Return only valid JSON. Tags must be short string key/value pairs.",
+    prompt: JSON.stringify({
+      instruction:
+        "Create automatic tags for each resource. Use CloudWatch Logs signals when present. Include keys such as workload, environment, activity, logging, and costReview only when supported by the metadata. Return {\"resources\":[{\"resourceId\":\"...\",\"tags\":{\"key\":\"value\"}}]}.",
+      resources: resources.slice(0, 120).map((resource) => ({
+        resourceId: resource.resourceId,
+        name: resource.resourceName,
+        type: resource.resourceType,
+        service: resource.service,
+        status: resource.status,
+        utilization: resource.utilization,
+        monthlyCost: resource.monthlyCost,
+        metadata: resource.metadata,
+      })),
+    }),
+  });
+
+  const parsed = parseJsonObject(result.text) as { resources?: { resourceId?: string; tags?: Record<string, string> }[] };
+  return new Map(
+    (parsed.resources ?? [])
+      .filter((item): item is { resourceId: string; tags: Record<string, string> } => Boolean(item.resourceId && item.tags))
+      .map((item) => [item.resourceId, item.tags]),
+  );
+}
+
 function parseJsonObject(text: string) {
   try {
     return JSON.parse(text);
@@ -552,6 +614,21 @@ export const awsInitialScan = task({
       })
       .returning();
 
+    const [historyEntry] = await db
+      .insert(jobHistory)
+      .values({
+        organizationId: payload.organizationId,
+        cloudAccountId: payload.cloudAccountId,
+        scanJobId: scanJob.id,
+        triggerRunId: payload.triggerRunId,
+        taskIdentifier: "aws-initial-scan",
+        jobType: "aws_inventory_scan",
+        status: "running",
+        message: "AWS inventory scan started.",
+        startedAt,
+      })
+      .returning();
+
     try {
       const credentials = await validateAssumeRole(payload.roleArn, payload.externalId);
       const fallbackRegion = payload.region ?? "ap-south-1";
@@ -584,6 +661,7 @@ export const awsInitialScan = task({
           resourceType: "s3-bucket",
           service: "s3",
           region: "global",
+          tags: { provider: "aws", service: "s3", resourceType: "s3-bucket" },
           metadata: { creationDate: bucket.CreationDate?.toISOString(), s3Activity },
         });
       }
@@ -613,6 +691,7 @@ export const awsInitialScan = task({
             service: "ec2",
             status: instance.State?.Name,
             utilization: cloudWatchMetrics?.enabled ? cpu?.average : undefined,
+            tags: awsTagsToRecord(instance.Tags),
             metadata: {
               instanceType: instance.InstanceType,
               launchTime: instance.LaunchTime?.toISOString(),
@@ -634,6 +713,7 @@ export const awsInitialScan = task({
             region,
             service: "ec2",
             status: volume.State,
+            tags: { provider: "aws", service: "ec2", resourceType: "ec2-volume" },
             metadata: {
               size: volume.Size,
               volumeType: volume.VolumeType,
@@ -663,6 +743,7 @@ export const awsInitialScan = task({
             region,
             service: "rds",
             status: dbInstance.DBInstanceStatus,
+            tags: { provider: "aws", service: "rds", resourceType: "rds-instance" },
             metadata: {
               instanceClass: dbInstance.DBInstanceClass,
               engine: dbInstance.Engine,
@@ -691,6 +772,7 @@ export const awsInitialScan = task({
             region,
             service: "elasticloadbalancing",
             status: loadBalancer.State?.Code,
+            tags: { provider: "aws", service: "elasticloadbalancing", resourceType: "load-balancer" },
             metadata: {
               type: loadBalancer.Type,
               scheme: loadBalancer.Scheme,
@@ -706,6 +788,12 @@ export const awsInitialScan = task({
         counts.lambdaFunctions += functions.length;
         for (const fn of functions) {
           if (!fn.FunctionArn && !fn.FunctionName) continue;
+          const logGroup = fn.FunctionName
+            ? await getLogGroupSummary(region, credentials, `/aws/lambda/${fn.FunctionName}`).catch((error: unknown) => {
+                errors.push(`cloudwatch-logs/lambda/${fn.FunctionName}: ${error instanceof Error ? error.message : "logs failed"}`);
+                return undefined;
+              })
+            : undefined;
           const cloudWatchMetrics = fn.FunctionName
             ? await getLambdaCloudWatchMetrics(region, credentials, fn.FunctionName).catch((error: unknown) => {
                 errors.push(`cloudwatch/lambda/${fn.FunctionName}: ${error instanceof Error ? error.message : "metrics failed"}`);
@@ -719,11 +807,13 @@ export const awsInitialScan = task({
             region,
             service: "lambda",
             status: fn.State,
+            tags: { provider: "aws", service: "lambda", resourceType: "lambda-function" },
             metadata: {
               runtime: fn.Runtime,
               memorySize: fn.MemorySize,
               codeSize: fn.CodeSize,
               lastModified: fn.LastModified,
+              cloudWatchLogs: logGroup,
               cloudWatchMetrics,
             },
           });
@@ -737,6 +827,19 @@ export const awsInitialScan = task({
       const resourcesFound = Object.values(counts).reduce((total, count) => total + count, 0);
       for (const resource of resources) {
         resource.monthlyCost = formatMoney(estimateMonthlyCost(resource));
+      }
+      const aiTagsByResourceId = await buildAiTags(resources).catch((error: unknown) => {
+        regionErrors.aiTags = [error instanceof Error ? error.message : "AI tagging failed"];
+        return new Map<string, Record<string, string>>();
+      });
+      for (const resource of resources) {
+        resource.tags = {
+          provider: "aws",
+          service: resource.service ?? "unknown",
+          resourceType: resource.resourceType,
+          ...(resource.tags ?? {}),
+          ...(aiTagsByResourceId.get(resource.resourceId) ?? {}),
+        };
       }
       const estimatedMonthlyCost = formatMoney(resources.reduce((total, resource) => total + (resource.monthlyCost ?? 0), 0));
 
@@ -765,6 +868,7 @@ export const awsInitialScan = task({
             status: resource.status,
             monthlyCost: String(resource.monthlyCost ?? 0),
             utilization: typeof resource.utilization === "number" ? String(resource.utilization) : undefined,
+            tags: resource.tags,
             metadata: resource.metadata,
             firstSeenAt: completedAt,
             lastSeenAt: completedAt,
@@ -811,6 +915,24 @@ export const awsInitialScan = task({
         .where(eq(scanJobs.id, scanJob.id));
 
       await db
+        .update(jobHistory)
+        .set({
+          status: "completed",
+          message: `AWS inventory scan completed with ${resourcesFound} resources.`,
+          completedAt,
+          resourcesFound,
+          metadata: {
+            regions,
+            counts,
+            estimatedMonthlyCost,
+            resourcesStored: resources.length,
+            recommendationsCreated: recommendations.length,
+            regionErrors,
+          },
+        })
+        .where(eq(jobHistory.id, historyEntry.id));
+
+      await db
         .update(cloudAccounts)
         .set({
           status: "connected",
@@ -837,6 +959,18 @@ export const awsInitialScan = task({
           },
         })
         .where(eq(scanJobs.id, scanJob.id));
+
+      await db
+        .update(jobHistory)
+        .set({
+          status: "failed",
+          message: error instanceof Error ? error.message : "Initial scan failed",
+          completedAt: new Date(),
+          metadata: {
+            error: error instanceof Error ? error.message : "Initial scan failed",
+          },
+        })
+        .where(eq(jobHistory.id, historyEntry.id));
 
       await db
         .update(cloudAccounts)

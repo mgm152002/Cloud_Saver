@@ -62,7 +62,10 @@ function buildExecutionPlan(
       cpu?: { average?: number; maximum?: number; datapoints?: number };
       databaseConnections?: { average?: number; maximum?: number };
       requestCount?: { sum?: number };
+      activeConnectionCount?: { sum?: number };
       invocations?: { sum?: number };
+      errors?: { sum?: number };
+      duration?: { average?: number };
       readOps?: { sum?: number };
       writeOps?: { sum?: number };
     };
