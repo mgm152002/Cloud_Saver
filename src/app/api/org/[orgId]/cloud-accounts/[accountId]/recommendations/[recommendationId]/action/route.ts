@@ -1,4 +1,5 @@
 import { auth } from "@/app/lib/auth";
+import { getS3MetricState } from "@/app/lib/s3-metrics";
 import { aiRecommendations, aiRemediations, cloudAccounts, cloudResources, organizations } from "@/db/auth-schema";
 import { db } from "@/db/db";
 import { and, eq } from "drizzle-orm";
@@ -350,6 +351,7 @@ function buildExecutionPlan(
   }
 
   if (resource?.resourceType === "s3-bucket") {
+    const s3Metrics = getS3MetricState(metadata as Record<string, unknown> | null);
     return {
       actionType: "s3_archive_or_delete_idle_bucket",
       executionPlan: {
@@ -359,8 +361,8 @@ function buildExecutionPlan(
         resourceName: resource.resourceName,
         currentState: {
           monthlyCost: resource.monthlyCost,
-          totalRequests30d: (metadata as { s3Activity?: { totalRequests?: number; storageBytes?: number } } | null)?.s3Activity?.totalRequests,
-          storageBytes: (metadata as { s3Activity?: { totalRequests?: number; storageBytes?: number } } | null)?.s3Activity?.storageBytes,
+          totalRequests30d: s3Metrics.totalRequests,
+          storageBytes: s3Metrics.storageBytes,
         },
         targetState: {
           action: "archive objects or delete bucket only after owner approval",
@@ -370,8 +372,8 @@ function buildExecutionPlan(
         recommendation: recommendation.recommendation,
         estimatedSavings: recommendation.estimatedSavings,
         evidence: [
-          `S3 requests over 30d: ${(metadata as { s3Activity?: { totalRequests?: number } } | null)?.s3Activity?.totalRequests ?? "unknown"}`,
-          `Bucket size bytes: ${(metadata as { s3Activity?: { storageBytes?: number } } | null)?.s3Activity?.storageBytes ?? "unknown"}`,
+          `S3 requests over 30d: ${s3Metrics.totalRequests ?? "unknown"}`,
+          `Bucket size bytes: ${s3Metrics.storageBytes ?? "unknown"}`,
         ],
         steps: [
           `Confirm bucket owner and retention requirements for ${resource.resourceId}.`,

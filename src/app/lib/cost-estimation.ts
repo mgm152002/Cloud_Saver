@@ -1,3 +1,5 @@
+import { getS3MetricState } from "@/app/lib/s3-metrics";
+
 type CostResource = {
   resourceType: string;
   status?: string;
@@ -101,8 +103,8 @@ export function estimateResourceSavings(resource: CostResource, monthlyCost: num
   if (monthlyCost <= 0) return 0;
 
   if (resource.resourceType === "s3-bucket") {
-    const activity = resource.metadata?.s3Activity as { requestMetricsAvailable?: boolean; hasRecentRequests?: boolean } | undefined;
-    return activity?.requestMetricsAvailable === true && activity.hasRecentRequests === false ? monthlyCost : 0;
+    const activity = getS3MetricState(resource.metadata);
+    return activity.requestMetricsAvailable === true && activity.hasRecentRequests === false ? monthlyCost : 0;
   }
 
   if (resource.resourceType === "ec2-volume" && numberValue(resource.metadata?.attachments) === 0) {

@@ -41,6 +41,7 @@ import HistoryIcon from "@mui/icons-material/History";
 import LocalOfferIcon from "@mui/icons-material/LocalOffer";
 import EditIcon from "@mui/icons-material/Edit";
 import DashboardLayout from "../../../../../components/dashboard-layout";
+import { getS3MetricState } from "../../../../lib/s3-metrics";
 
 interface CloudAccount {
   id: string;
@@ -154,17 +155,17 @@ function tagsToText(tags: Record<string, string> | null) {
 
 function getMetricGap(resource: CloudResource): MetricGap | null {
   const metadata = resource.metadata as {
-    s3Activity?: { requestMetricsAvailable?: boolean };
     attachments?: number;
     cloudWatchMetrics?: { enabled?: boolean; cpu?: { datapoints?: number; average?: number; maximum?: number } };
     cpu?: { datapoints?: number };
   } | null;
 
-  if (resource.resourceType === "s3-bucket" && metadata?.s3Activity?.requestMetricsAvailable !== true) {
+  const s3Metrics = resource.resourceType === "s3-bucket" ? getS3MetricState(metadata) : null;
+  if (resource.resourceType === "s3-bucket" && !s3Metrics?.storageMetricsAvailable && !s3Metrics?.requestMetricsAvailable) {
     return {
       id: resource.id,
       resourceName: resource.resourceName || resource.resourceId,
-      message: "Enable S3 request metrics or server access logging before delete/archive recommendations.",
+      message: "S3 CloudWatch storage or request metrics were not available for this bucket.",
     };
   }
 

@@ -1,5 +1,6 @@
 import { createOpenRouterModel } from "@/app/lib/ai";
 import { auth } from "@/app/lib/auth";
+import { getS3MetricState } from "@/app/lib/s3-metrics";
 import { aiRecommendations, chatMessages, chatSessions, cloudAccounts, cloudResources, organizations } from "@/db/auth-schema";
 import { db } from "@/db/db";
 import { generateText, stepCountIs, tool } from "ai";
@@ -13,18 +14,18 @@ type ChatMessage = {
 
 function metricGapForResource(resource: typeof cloudResources.$inferSelect) {
   const metadata = resource.metadata as {
-    s3Activity?: { requestMetricsAvailable?: boolean };
     cloudWatchMetrics?: { enabled?: boolean; cpu?: { datapoints?: number } };
     attachments?: number;
     cpu?: { datapoints?: number };
   } | null;
 
-  if (resource.resourceType === "s3-bucket" && metadata?.s3Activity?.requestMetricsAvailable !== true) {
+  const s3Metrics = resource.resourceType === "s3-bucket" ? getS3MetricState(metadata) : null;
+  if (resource.resourceType === "s3-bucket" && !s3Metrics?.storageMetricsAvailable && !s3Metrics?.requestMetricsAvailable) {
     return {
       resourceId: resource.resourceId,
       resourceName: resource.resourceName,
       service: "s3",
-      message: "Enable S3 request metrics or server access logging before deleting or archiving this bucket.",
+      message: "S3 CloudWatch storage or request metrics were not available for this bucket.",
     };
   }
 

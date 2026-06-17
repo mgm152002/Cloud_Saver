@@ -1,4 +1,5 @@
 import { auth } from "@/app/lib/auth";
+import { getS3MetricState } from "@/app/lib/s3-metrics";
 import {
   aiRecommendations,
   aiRemediations,
@@ -22,6 +23,16 @@ function shouldShowRecommendation(
   const mentionedResource = resources.find((candidate) =>
     text.includes(candidate.resourceId.toLowerCase()) || Boolean(candidate.resourceName && text.includes(candidate.resourceName.toLowerCase())),
   );
+  const mentionedS3Resource = mentionedResource?.resourceType === "s3-bucket" ? mentionedResource : undefined;
+  const isS3ActivityRecommendation =
+    /\bs3\b|\bbucket\b/.test(text) &&
+    /\b(delete|remove|terminate|archive|idle|inactive|unused|decommission|tier|storage class|lifecycle|expire)\b/.test(text);
+
+  if (isS3ActivityRecommendation) {
+    if (!mentionedS3Resource) return false;
+    const metrics = getS3MetricState(mentionedS3Resource?.metadata as Record<string, unknown> | null);
+    return metrics.requestMetricsAvailable === true && metrics.hasRecentRequests === false;
+  }
 
   if (!/\b(delete|remove|terminate)\b/.test(text) || !/\bs3\b|\bbucket\b/.test(text)) {
     const ec2Resource = mentionedResource?.resourceType === "ec2-instance" ? mentionedResource : undefined;
@@ -77,12 +88,13 @@ function shouldShowRecommendation(
     return true;
   }
 
-  const resource = mentionedResource?.resourceType === "s3-bucket" ? mentionedResource : undefined;
+  const resource = mentionedS3Resource;
 
   if (!resource) return false;
 
-  const metadata = resource.metadata as { s3Activity?: { requestMetricsAvailable?: boolean; hasRecentRequests?: boolean } } | null;
-  return metadata?.s3Activity?.requestMetricsAvailable === true && metadata.s3Activity.hasRecentRequests === false;
+  const metadata = resource.metadata as Record<string, unknown> | null;
+  const s3Metrics = getS3MetricState(metadata);
+  return s3Metrics.requestMetricsAvailable === true && s3Metrics.hasRecentRequests === false;
 }
 
 export async function GET(

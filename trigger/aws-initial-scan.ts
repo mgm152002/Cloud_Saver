@@ -9,7 +9,7 @@ import {
   type Volume,
   EC2Client,
 } from "@aws-sdk/client-ec2";
-import { GetMetricStatisticsCommand, CloudWatchClient } from "@aws-sdk/client-cloudwatch";
+import { GetMetricStatisticsCommand, CloudWatchClient, ListMetricsCommand } from "@aws-sdk/client-cloudwatch";
 import { DescribeDBInstancesCommand, type DBInstance, type DescribeDBInstancesCommandOutput, RDSClient } from "@aws-sdk/client-rds";
 import { ListBucketsCommand, type Bucket, type ListBucketsCommandOutput, S3Client } from "@aws-sdk/client-s3";
 import { DescribeLoadBalancersCommand, type DescribeLoadBalancersCommandOutput, type LoadBalancer, ElasticLoadBalancingV2Client } from "@aws-sdk/client-elastic-load-balancing-v2";
@@ -21,6 +21,7 @@ import { z } from "zod";
 import { validateAssumeRole } from "@/app/lib/aws-onboarding";
 import { createOpenRouterModel } from "@/app/lib/ai";
 import { estimateMonthlyCost, estimateResourceSavings, formatMoney } from "@/app/lib/cost-estimation";
+import { getS3MetricState } from "@/app/lib/s3-metrics";
 import { db } from "@/db/db";
 import { aiRecommendations, cloudAccounts, cloudResources, jobHistory, scanJobs } from "@/db/auth-schema";
 
@@ -157,69 +158,6 @@ async function countS3Buckets(credentials: AssumedCredentials) {
   return response.Buckets ?? [];
 }
 
-async function getS3BucketActivity(credentials: AssumedCredentials, bucketName: string) {
-  const cloudwatch = new CloudWatchClient({ region: "us-east-1", credentials: clientCredentials(credentials) });
-  const endTime = new Date();
-  const startTime = new Date(endTime.getTime() - 30 * 24 * 60 * 60 * 1000);
-
-  const requestMetricNames = ["AllRequests", "GetRequests", "PutRequests", "DeleteRequests"];
-  const requestResults = await Promise.all(
-    requestMetricNames.map(async (metricName) => {
-      const response = await cloudwatch.send(
-        new GetMetricStatisticsCommand({
-          Namespace: "AWS/S3",
-          MetricName: metricName,
-          Dimensions: [
-            { Name: "BucketName", Value: bucketName },
-            { Name: "FilterId", Value: "EntireBucket" },
-          ],
-          StartTime: startTime,
-          EndTime: endTime,
-          Period: 86400,
-          Statistics: ["Sum"],
-        }),
-      );
-
-      return {
-        metricName,
-        datapoints: response.Datapoints?.length ?? 0,
-        requests: response.Datapoints?.reduce((total, point) => total + (point.Sum ?? 0), 0) ?? 0,
-      };
-    }),
-  );
-
-  const storageResponse = await cloudwatch.send(
-    new GetMetricStatisticsCommand({
-      Namespace: "AWS/S3",
-      MetricName: "BucketSizeBytes",
-      Dimensions: [
-        { Name: "BucketName", Value: bucketName },
-        { Name: "StorageType", Value: "StandardStorage" },
-      ],
-      StartTime: startTime,
-      EndTime: endTime,
-      Period: 86400,
-      Statistics: ["Average"],
-    }),
-  );
-
-  const latestStorage = [...(storageResponse.Datapoints ?? [])]
-    .sort((left, right) => (right.Timestamp?.getTime() ?? 0) - (left.Timestamp?.getTime() ?? 0))
-    .at(0);
-  const totalRequests = requestResults.reduce((total, metric) => total + metric.requests, 0);
-  const requestMetricDatapoints = requestResults.reduce((total, metric) => total + metric.datapoints, 0);
-
-  return {
-    lookbackDays: 30,
-    requestMetricsAvailable: requestMetricDatapoints > 0,
-    hasRecentRequests: requestMetricDatapoints > 0 ? totalRequests > 0 : undefined,
-    totalRequests,
-    requestMetrics: requestResults,
-    storageBytes: latestStorage?.Average ? Math.round(latestStorage.Average) : undefined,
-    storageMetricTimestamp: latestStorage?.Timestamp?.toISOString(),
-  };
-}
-
 async function getEc2MetricSummary(
   cloudwatch: CloudWatchClient,
   dimensions: { Name: string; Value: string }[],
@@ -316,6 +254,25 @@ async function getAwsMetricSummary(
   };
 }
 
+async function getS3RequestFilterId(cloudwatch: CloudWatchClient, bucketName: string) {
+  const response = await cloudwatch.send(
+    new ListMetricsCommand({
+      Namespace: "AWS/S3",
+      MetricName: "AllRequests",
+      Dimensions: [{ Name: "BucketName", Value: bucketName }],
+    }),
+  );
+  const filterIds = [
+    ...new Set(
+      (response.Metrics ?? [])
+        .map((metric) => metric.Dimensions?.find((dimension) => dimension.Name === "FilterId")?.Value)
+        .filter((value): value is string => Boolean(value)),
+    ),
+  ];
+
+  return filterIds.includes("EntireBucket") ? "EntireBucket" : filterIds[0] ?? "EntireBucket";
+}
+
 function metricWindow(days = 14) {
   const endTime = new Date();
   const startTime = new Date(endTime.getTime() - days * 24 * 60 * 60 * 1000);
@@ -341,6 +298,63 @@ async function getEbsCloudWatchMetrics(region: string, credentials: AssumedCrede
     readOps,
     writeOps,
     queueLength,
+  };
+}
+
+async function getS3CloudWatchMetrics(region: string, credentials: AssumedCredentials, bucketName: string) { 
+  const cloudwatch = new CloudWatchClient({ region, credentials: clientCredentials(credentials) });
+  const { startTime, endTime, days } = metricWindow(30);
+  const filterId = await getS3RequestFilterId(cloudwatch, bucketName).catch(() => "EntireBucket");
+  const storageDimensions = [
+    { Name: "BucketName", Value: bucketName },
+    { Name: "StorageType", Value: "StandardStorage" },
+  ];
+  const objectDimensions = [
+    { Name: "BucketName", Value: bucketName },
+    { Name: "StorageType", Value: "AllStorageTypes" },
+  ];
+  const requestDimensions = [
+    { Name: "BucketName", Value: bucketName },
+    { Name: "FilterId", Value: filterId },
+  ];
+
+  const [bucketSize, objectCount, allRequests, getRequests, putRequests, deleteRequests, bytesDownloaded, bytesUploaded] =
+    await Promise.all([
+      getAwsMetricSummary(cloudwatch, "AWS/S3", storageDimensions, "BucketSizeBytes", ["Average"], startTime, endTime),
+      getAwsMetricSummary(cloudwatch, "AWS/S3", objectDimensions, "NumberOfObjects", ["Average"], startTime, endTime),
+      getAwsMetricSummary(cloudwatch, "AWS/S3", requestDimensions, "AllRequests", ["Sum"], startTime, endTime),
+      getAwsMetricSummary(cloudwatch, "AWS/S3", requestDimensions, "GetRequests", ["Sum"], startTime, endTime),
+      getAwsMetricSummary(cloudwatch, "AWS/S3", requestDimensions, "PutRequests", ["Sum"], startTime, endTime),
+      getAwsMetricSummary(cloudwatch, "AWS/S3", requestDimensions, "DeleteRequests", ["Sum"], startTime, endTime),
+      getAwsMetricSummary(cloudwatch, "AWS/S3", requestDimensions, "BytesDownloaded", ["Sum"], startTime, endTime),
+      getAwsMetricSummary(cloudwatch, "AWS/S3", requestDimensions, "BytesUploaded", ["Sum"], startTime, endTime),
+    ]);
+  const requestDatapoints =
+    allRequests.datapoints +
+    getRequests.datapoints +
+    putRequests.datapoints +
+    deleteRequests.datapoints +
+    bytesDownloaded.datapoints +
+    bytesUploaded.datapoints;
+  const totalRequests = (allRequests.sum ?? 0) + (getRequests.sum ?? 0) + (putRequests.sum ?? 0) + (deleteRequests.sum ?? 0);
+
+  return {
+    namespace: "AWS/S3",
+    lookbackDays: days,
+    filterId,
+    enabled: requestDatapoints + bucketSize.datapoints + objectCount.datapoints > 0,
+    requestMetricsAvailable: requestDatapoints > 0,
+    hasRecentRequests: requestDatapoints > 0 ? totalRequests > 0 : undefined,
+    totalRequests,
+    storageBytes: bucketSize.average ? Math.round(bucketSize.average) : undefined,
+    bucketSize,
+    objectCount,
+    allRequests,
+    getRequests,
+    putRequests,
+    deleteRequests,
+    bytesDownloaded,
+    bytesUploaded,
   };
 }
 
@@ -549,16 +563,16 @@ async function buildRecommendations(resources: ScannedResource[], counts: Record
             resourceId,
             monthlyCost: resource.monthlyCost ?? 0,
             estimatedSavings: formatMoney(estimateResourceSavings(resource, resource.monthlyCost ?? 0)),
-            s3Activity: resource.metadata?.s3Activity,
+            s3Activity: getS3MetricState(resource.metadata),
           };
         },
       }),
     },
     system:
-      "You are a cloud cost optimization assistant. Use the provided tools before finalizing recommendations. Return only valid JSON with a recommendations array. Never invent exact AWS bills; ground savings in scanned monthlyCost, status, utilization, and metadata. For EC2, EBS, RDS, load balancers, and Lambda, require metadata.cloudWatchMetrics.enabled=true before recommending rightsizing, deletion, stopping, or scheduling. If required CloudWatch metrics are missing, recommend enabling or validating metrics instead of taking action. For S3 buckets, do not recommend deletion unless metadata.s3Activity.requestMetricsAvailable is true and metadata.s3Activity.hasRecentRequests is false.",
+      "You are a cloud cost optimization assistant. Use the provided tools before finalizing recommendations. Return only valid JSON with a recommendations array. Never invent exact AWS bills; ground savings in scanned monthlyCost, status, utilization, and metadata. For EC2, EBS, RDS, load balancers, and Lambda, require metadata.cloudWatchMetrics.enabled=true before recommending rightsizing, deletion, stopping, or scheduling. If required CloudWatch metrics are missing, recommend enabling or validating metrics instead of taking action. For S3 buckets, storage metrics alone prove CloudWatch is present but do not prove usage. Do not recommend delete, archive, lifecycle expiry, storage-class tiering, or idle-bucket cleanup unless metadata.s3Activity.requestMetricsAvailable is true and metadata.s3Activity.hasRecentRequests is false.",
     prompt: JSON.stringify({
       instruction:
-        "Create up to 6 AWS cost-saving recommendations. Include resourceId, title, recommendation, estimatedSavings monthly USD number, severity low/medium/high, confidence 0-100. Prefer idle unattached volumes, EC2 instances with CloudWatch CPU average under 8% and maximum under 25%, RDS instances with low CPU and near-zero connections, load balancers with zero RequestCount, and Lambda functions with zero Invocations. Use metadata.cloudWatchMetrics for EC2/EBS/RDS/ELB/Lambda and never recommend rightsizing/deleting/stopping these resources when metrics are missing. For S3, use CloudWatch AWS/S3 request metrics from metadata.s3Activity; if request metrics are unavailable, recommend enabling S3 request metrics or server access logging instead of deleting the bucket. Call summarizeInventory and estimateSavings for recommendations tied to specific resources.",
+        "Create up to 6 AWS cost-saving recommendations. Include resourceId, title, recommendation, estimatedSavings monthly USD number, severity low/medium/high, confidence 0-100. Prefer idle unattached volumes, EC2 instances with CloudWatch CPU average under 8% and maximum under 25%, RDS instances with low CPU and near-zero connections, load balancers with zero RequestCount, and Lambda functions with zero Invocations. Use metadata.cloudWatchMetrics for EC2/EBS/RDS/ELB/Lambda and never recommend rightsizing/deleting/stopping these resources when metrics are missing. For S3, metadata.cloudWatchMetrics.bucketSize/objectCount are storage metrics only; they are not usage evidence. Only recommend S3 delete/archive/lifecycle/tiering/idle cleanup when metadata.s3Activity.requestMetricsAvailable=true and metadata.s3Activity.hasRecentRequests=false. Call summarizeInventory and estimateSavings for recommendations tied to specific resources.",
       counts,
       totalMonthlyCost,
       resources: promptResources,
@@ -575,11 +589,14 @@ async function buildRecommendations(resources: ScannedResource[], counts: Record
           text.includes(candidate.resourceId.toLowerCase()) ||
           (candidate.resourceName && text.includes(candidate.resourceName.toLowerCase())),
       );
-      const isS3Delete = resource?.resourceType === "s3-bucket" && /\b(delete|remove|terminate)\b/.test(text);
-      if (!isS3Delete) return true;
+      const isS3ActivityRecommendation =
+        /\bs3\b|\bbucket\b/.test(text) &&
+        /\b(delete|remove|terminate|archive|idle|inactive|unused|decommission|tier|storage class|lifecycle|expire)\b/.test(text);
+      if (!isS3ActivityRecommendation) return true;
+      if (resource?.resourceType !== "s3-bucket") return false;
 
-      const activity = resource?.metadata?.s3Activity as { requestMetricsAvailable?: boolean; hasRecentRequests?: boolean } | undefined;
-      return activity?.requestMetricsAvailable === true && activity.hasRecentRequests === false;
+      const activity = getS3MetricState(resource?.metadata);
+      return activity.requestMetricsAvailable === true && activity.hasRecentRequests === false;
     })
     .filter((recommendation) => {
       const text = `${recommendation.title} ${recommendation.recommendation}`.toLowerCase();
@@ -648,13 +665,9 @@ export const awsInitialScan = task({
       counts.s3Buckets = buckets.length;
       for (const bucket of buckets) {
         if (!bucket.Name) continue;
-        const s3Activity = await getS3BucketActivity(credentials, bucket.Name).catch((error: unknown) => {
-          regionErrors.s3 = [
-            ...(regionErrors.s3 ?? []),
-            `${bucket.Name}: ${error instanceof Error ? error.message : "CloudWatch S3 metrics failed"}`,
-          ];
-          return undefined;
-        });
+        const region = bucket.BucketRegion ?? fallbackRegion;
+        const cloudWatchMetrics = await getS3CloudWatchMetrics(region, credentials, bucket.Name).catch(() => undefined);
+        const s3Activity = getS3MetricState({ cloudWatchMetrics });
         resources.push({
           resourceId: bucket.Name,
           resourceName: bucket.Name,
@@ -662,12 +675,13 @@ export const awsInitialScan = task({
           service: "s3",
           region: "global",
           tags: { provider: "aws", service: "s3", resourceType: "s3-bucket" },
-          metadata: { creationDate: bucket.CreationDate?.toISOString(), s3Activity },
+          metadata: { creationDate: bucket.CreationDate?.toISOString(), cloudWatchMetrics, s3Activity },
         });
       }
-
       for (const region of regions) {
         const errors: string[] = [];
+        
+      
 
         const ec2Counts = await countEc2Resources(region, credentials).catch((error: unknown) => {
           errors.push(`ec2: ${error instanceof Error ? error.message : "failed"}`);
@@ -855,6 +869,7 @@ export const awsInitialScan = task({
         .where(and(eq(cloudResources.organizationId, payload.organizationId), eq(cloudResources.cloudAccountId, payload.cloudAccountId)));
 
       if (resources.length > 0) {
+        
         await db.insert(cloudResources).values(
           resources.map((resource) => ({
             organizationId: payload.organizationId,
@@ -873,6 +888,14 @@ export const awsInitialScan = task({
             firstSeenAt: completedAt,
             lastSeenAt: completedAt,
           })),
+        )
+        
+        await db.delete(cloudResources).where(
+          and(
+            eq(cloudResources.organizationId, payload.organizationId),
+            eq(cloudResources.cloudAccountId, payload.cloudAccountId),
+            eq(cloudResources.status, "terminated"),
+          ),
         );
       }
 
