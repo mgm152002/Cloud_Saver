@@ -16,14 +16,14 @@ import { DescribeLoadBalancersCommand, type DescribeLoadBalancersCommandOutput, 
 import { LambdaClient, ListFunctionsCommand, type FunctionConfiguration, type ListFunctionsCommandOutput } from "@aws-sdk/client-lambda";
 import { CloudWatchLogsClient, DescribeLogGroupsCommand } from "@aws-sdk/client-cloudwatch-logs";
 import { generateText, stepCountIs, tool } from "ai";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import { validateAssumeRole } from "@/app/lib/aws-onboarding";
 import { createOpenRouterModel } from "@/app/lib/ai";
 import { estimateMonthlyCost, estimateResourceSavings, formatMoney } from "@/app/lib/cost-estimation";
 import { getS3MetricState } from "@/app/lib/s3-metrics";
 import { db } from "@/db/db";
-import { aiRecommendations, cloudAccounts, cloudResources, jobHistory, scanJobs } from "@/db/auth-schema";
+import { aiRecommendations, alerts, cloudAccounts, cloudResources, jobHistory, resourceCostHistory, scanJobs } from "@/db/auth-schema";
 
 type AwsInitialScanPayload = {
   organizationId: string;
@@ -57,6 +57,15 @@ type AiRecommendation = {
   severity: string;
   confidence: number;
 };
+
+function numericValue(value: unknown, fallback = 0) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "string") return fallback;
+  const match = value.replaceAll(",", "").match(/-?\d+(\.\d+)?/);
+  if (!match) return fallback;
+  const parsed = Number(match[0]);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
 
 type MetricSummary = {
   metricName: string;
@@ -572,7 +581,7 @@ async function buildRecommendations(resources: ScannedResource[], counts: Record
       "You are a cloud cost optimization assistant. Use the provided tools before finalizing recommendations. Return only valid JSON with a recommendations array. Never invent exact AWS bills; ground savings in scanned monthlyCost, status, utilization, and metadata. For EC2, EBS, RDS, load balancers, and Lambda, require metadata.cloudWatchMetrics.enabled=true before recommending rightsizing, deletion, stopping, or scheduling. If required CloudWatch metrics are missing, recommend enabling or validating metrics instead of taking action. For S3 buckets, storage metrics alone prove CloudWatch is present but do not prove usage. Do not recommend delete, archive, lifecycle expiry, storage-class tiering, or idle-bucket cleanup unless metadata.s3Activity.requestMetricsAvailable is true and metadata.s3Activity.hasRecentRequests is false.",
     prompt: JSON.stringify({
       instruction:
-        "Create up to 6 AWS cost-saving recommendations. Include resourceId, title, recommendation, estimatedSavings monthly USD number, severity low/medium/high, confidence 0-100. Prefer idle unattached volumes, EC2 instances with CloudWatch CPU average under 8% and maximum under 25%, RDS instances with low CPU and near-zero connections, load balancers with zero RequestCount, and Lambda functions with zero Invocations. Use metadata.cloudWatchMetrics for EC2/EBS/RDS/ELB/Lambda and never recommend rightsizing/deleting/stopping these resources when metrics are missing. For S3, metadata.cloudWatchMetrics.bucketSize/objectCount are storage metrics only; they are not usage evidence. Only recommend S3 delete/archive/lifecycle/tiering/idle cleanup when metadata.s3Activity.requestMetricsAvailable=true and metadata.s3Activity.hasRecentRequests=false. Call summarizeInventory and estimateSavings for recommendations tied to specific resources.",
+        "Create AWS cost-saving recommendations. Include resourceId, title, recommendation, estimatedSavings monthly USD number, severity low/medium/high, confidence 0-100. Prefer idle unattached volumes, EC2 instances with CloudWatch CPU average under 8% and maximum under 25%, RDS instances with low CPU and near-zero connections, load balancers with zero RequestCount, and Lambda functions with zero Invocations. Use metadata.cloudWatchMetrics for EC2/EBS/RDS/ELB/Lambda and never recommend rightsizing/deleting/stopping these resources when metrics are missing. For S3, metadata.cloudWatchMetrics.bucketSize/objectCount are storage metrics only; they are not usage evidence. Only recommend S3 delete/archive/lifecycle/tiering/idle cleanup when metadata.s3Activity.requestMetricsAvailable=true and metadata.s3Activity.hasRecentRequests=false. Call summarizeInventory and estimateSavings for recommendations tied to specific resources.",
       counts,
       totalMonthlyCost,
       resources: promptResources,
@@ -580,7 +589,7 @@ async function buildRecommendations(resources: ScannedResource[], counts: Record
   });
 
   const parsed = parseJsonObject(result.text) as { recommendations?: AiRecommendation[] };
-  return (parsed.recommendations ?? [])
+  const aiRecommendations = (parsed.recommendations ?? [])
     .filter((recommendation) => {
       const text = `${recommendation.title} ${recommendation.recommendation}`.toLowerCase();
       const resource = resources.find(
@@ -614,6 +623,82 @@ async function buildRecommendations(resources: ScannedResource[], counts: Record
       return metrics?.enabled === true && Boolean(metrics.cpu?.datapoints) && Number(metrics.cpu?.average ?? 100) < 8 && Number(metrics.cpu?.maximum ?? 100) < 25;
     })
     .slice(0, 6);
+
+  return mergeDeterministicRecommendations(aiRecommendations, resources).slice(0, 8);
+}
+
+function buildEbsRecommendation(resource: ScannedResource): AiRecommendation | null {
+  if (resource.resourceType !== "ec2-volume") return null;
+
+  const metadata = resource.metadata as {
+    attachments?: number;
+    size?: number;
+    volumeType?: string;
+    cloudWatchMetrics?: { enabled?: boolean; readOps?: { sum?: number }; writeOps?: { sum?: number } };
+  } | null;
+  const monthlyCost = numericValue(resource.monthlyCost);
+  if (monthlyCost <= 0) return null;
+
+  const attachments = numericValue(metadata?.attachments);
+  const readOps = numericValue(metadata?.cloudWatchMetrics?.readOps?.sum);
+  const writeOps = numericValue(metadata?.cloudWatchMetrics?.writeOps?.sum);
+  const totalOps = readOps + writeOps;
+
+  if (attachments === 0) {
+    return {
+      resourceId: resource.resourceId,
+      title: "Delete unattached EBS volume",
+      recommendation: `${resource.resourceId} is unattached. Create a final snapshot, then delete the volume to save approximately ${formatMoney(monthlyCost)} per month.`,
+      estimatedSavings: formatMoney(monthlyCost),
+      severity: monthlyCost >= 20 ? "high" : "medium",
+      confidence: 95,
+    };
+  }
+
+  if (metadata?.cloudWatchMetrics?.enabled === true && totalOps === 0) {
+    return {
+      resourceId: resource.resourceId,
+      title: "Review idle EBS volume",
+      recommendation: `${resource.resourceId} has no observed read/write operations. Confirm ownership, snapshot it, then detach/delete if unused to save approximately ${formatMoney(monthlyCost * 0.8)} per month.`,
+      estimatedSavings: formatMoney(monthlyCost * 0.8),
+      severity: monthlyCost >= 20 ? "high" : "medium",
+      confidence: 80,
+    };
+  }
+
+  return null;
+}
+
+function mergeDeterministicRecommendations(recommendations: AiRecommendation[], resources: ScannedResource[]) {
+  const seenResourceIds = new Set(recommendations.map((recommendation) => recommendation.resourceId).filter(Boolean));
+  const deterministic = resources
+    .map(buildEbsRecommendation)
+    .filter((recommendation): recommendation is AiRecommendation => Boolean(recommendation))
+    .filter((recommendation) => !seenResourceIds.has(recommendation.resourceId));
+
+  return [...recommendations, ...deterministic];
+}
+
+function recommendationSavings(recommendation: AiRecommendation, resources: ScannedResource[]) {
+  const parsed = numericValue(recommendation.estimatedSavings);
+  if (parsed > 0) return parsed;
+
+  const resource = resources.find((candidate) => candidate.resourceId === recommendation.resourceId);
+  if (!resource) return 0;
+
+  return formatMoney(estimateResourceSavings(resource, numericValue(resource.monthlyCost)));
+}
+
+function findRecommendationResource(
+  recommendation: AiRecommendation,
+  storedResources: Pick<typeof cloudResources.$inferSelect, "id" | "resourceId" | "resourceName">[],
+) {
+  const text = `${recommendation.title} ${recommendation.recommendation}`.toLowerCase();
+  return storedResources.find((resource) => {
+    const externalIdMatch = recommendation.resourceId === resource.resourceId || text.includes(resource.resourceId.toLowerCase());
+    const nameMatch = Boolean(resource.resourceName && text.includes(resource.resourceName.toLowerCase()));
+    return externalIdMatch || nameMatch;
+  });
 }
 
 export const awsInitialScan = task({
@@ -864,14 +949,28 @@ export const awsInitialScan = task({
         .set({ status: "stale" })
         .where(and(eq(aiRecommendations.organizationId, payload.organizationId), eq(aiRecommendations.status, "pending")));
 
+      const oldResources = await db
+        .select({ id: cloudResources.id })
+        .from(cloudResources)
+        .where(and(eq(cloudResources.organizationId, payload.organizationId), eq(cloudResources.cloudAccountId, payload.cloudAccountId)));
+      const oldResourceIds = oldResources.map((resource) => resource.id);
+
+      if (oldResourceIds.length > 0) {
+        await db.update(aiRecommendations).set({ resourceId: null }).where(inArray(aiRecommendations.resourceId, oldResourceIds));
+        await db.update(alerts).set({ resourceId: null }).where(inArray(alerts.resourceId, oldResourceIds));
+        await db.delete(resourceCostHistory).where(inArray(resourceCostHistory.resourceId, oldResourceIds));
+      }
+
       await db
         .delete(cloudResources)
         .where(and(eq(cloudResources.organizationId, payload.organizationId), eq(cloudResources.cloudAccountId, payload.cloudAccountId)));
 
-      if (resources.length > 0) {
-        
-        await db.insert(cloudResources).values(
-          resources.map((resource) => ({
+      let storedResources: Pick<typeof cloudResources.$inferSelect, "id" | "resourceId" | "resourceName">[] = [];
+      const activeResources = resources.filter((resource) => resource.status !== "terminated");
+
+      if (activeResources.length > 0) {
+        storedResources = await db.insert(cloudResources).values(
+          activeResources.map((resource) => ({
             organizationId: payload.organizationId,
             cloudAccountId: payload.cloudAccountId,
             provider: "aws",
@@ -888,15 +987,11 @@ export const awsInitialScan = task({
             firstSeenAt: completedAt,
             lastSeenAt: completedAt,
           })),
-        )
-        
-        await db.delete(cloudResources).where(
-          and(
-            eq(cloudResources.organizationId, payload.organizationId),
-            eq(cloudResources.cloudAccountId, payload.cloudAccountId),
-            eq(cloudResources.status, "terminated"),
-          ),
-        );
+        ).returning({
+          id: cloudResources.id,
+          resourceId: cloudResources.resourceId,
+          resourceName: cloudResources.resourceName,
+        });
       }
 
       const recommendations = await buildRecommendations(resources, counts).catch((error: unknown) => {
@@ -906,15 +1001,21 @@ export const awsInitialScan = task({
 
       if (recommendations.length > 0) {
         await db.insert(aiRecommendations).values(
-          recommendations.map((recommendation) => ({
-            organizationId: payload.organizationId,
-            title: recommendation.title,
-            recommendation: recommendation.recommendation,
-            estimatedSavings: String(Math.max(0, recommendation.estimatedSavings || 0)),
-            severity: recommendation.severity,
-            confidence: recommendation.confidence,
-            status: "pending",
-          })),
+          recommendations.map((recommendation) => {
+            const resource = findRecommendationResource(recommendation, storedResources);
+
+            return {
+              organizationId: payload.organizationId,
+              accountId: payload.cloudAccountId,
+              resourceId: resource?.id,
+              title: recommendation.title,
+              recommendation: recommendation.recommendation,
+              estimatedSavings: String(Math.max(0, recommendationSavings(recommendation, resources))),
+              severity: recommendation.severity,
+              confidence: recommendation.confidence,
+              status: "pending",
+            };
+          }),
         );
       }
 

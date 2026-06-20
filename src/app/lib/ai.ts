@@ -13,5 +13,5 @@ export function createOpenRouterModel() {
     },
   });
 
-  return openrouter.chat(process.env.OPENROUTER_MODEL ?? "openai/gpt-4o-mini");
+  return openrouter.chat(process.env.OPENROUTER_MODEL ?? "openai/gpt-5.4");
 }

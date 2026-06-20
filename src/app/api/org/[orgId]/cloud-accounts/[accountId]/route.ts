@@ -163,14 +163,19 @@ export async function GET(
   const actionPlans = await db
     .select()
     .from(aiRemediations)
-    .where(and(eq(aiRemediations.organizationId, orgId), eq(aiRemediations.status, "approved")))
+    .where(and(eq(aiRemediations.organizationId, orgId), inArray(aiRemediations.status, ["approved", "queued", "executing", "implemented", "completed", "needs_review", "failed"])))
     .orderBy(desc(aiRemediations.createdAt))
     .limit(5);
 
   const estimatedMonthlyCost = resources.reduce((total, resource) => total + Number(resource.monthlyCost ?? 0), 0);
+  const recommendationSavings = recommendations.reduce((total, recommendation) => total + Number(recommendation.estimatedSavings ?? 0), 0);
+  const actionPlanSavings = actionPlans.reduce((total, plan) => {
+    const executionPlan = plan.executionPlan as { estimatedSavings?: string | number | null } | null;
+    return total + Number(executionPlan?.estimatedSavings ?? 0);
+  }, 0);
   const estimatedSavings = Math.min(
     estimatedMonthlyCost,
-    recommendations.reduce((total, recommendation) => total + Number(recommendation.estimatedSavings ?? 0), 0),
+    recommendationSavings + actionPlanSavings,
   );
 
   return Response.json({

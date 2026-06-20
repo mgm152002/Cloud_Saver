@@ -181,6 +181,7 @@ export const aiRecommendations = pgTable("ai_recommendations", {
   organizationId: uuid("organization_id")
     .references(() => organizations.id)
     .notNull(),
+  accountId: uuid("account_id").references(() => cloudAccounts.id),
   resourceId: uuid("resource_id").references(() => cloudResources.id),
   title: varchar("title", { length: 500 }),
   recommendation: text("recommendation").notNull(),
@@ -351,10 +352,14 @@ export const resourceCostHistoryRelations = relations(resourceCostHistory, ({ on
   }),
 }));
 
-export const aiRecommendationsRelations = relations(aiRecommendations, ({ one }) => ({
+export const aiRecommendationsRelations = relations(aiRecommendations, ({ one , many }) => ({
   organization: one(organizations, {
     fields: [aiRecommendations.organizationId],
     references: [organizations.id],
+  }),
+  account: one(cloudAccounts, {
+    fields: [aiRecommendations.accountId],
+    references: [cloudAccounts.id],
   }),
   resource: one(cloudResources, {
     fields: [aiRecommendations.resourceId],

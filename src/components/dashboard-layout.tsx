@@ -39,6 +39,154 @@ interface AgentMessage {
   content: string;
 }
 
+function renderInlineText(text: string) {
+  const parts = text.split(/(`[^`]+`)/g);
+
+  return parts.map((part, index) => {
+    if (part.startsWith("`") && part.endsWith("`")) {
+      return (
+        <Box
+          key={`${part}-${index}`}
+          component="code"
+          sx={{
+            px: 0.5,
+            py: 0.15,
+            borderRadius: 0.75,
+            bgcolor: "action.selected",
+            fontFamily: "var(--font-geist-mono)",
+            fontSize: "0.85em",
+          }}
+        >
+          {part.slice(1, -1)}
+        </Box>
+      );
+    }
+
+    return <React.Fragment key={`${part}-${index}`}>{part}</React.Fragment>;
+  });
+}
+
+function AssistantMessageContent({ content }: { content: string }) {
+  const lines = content.split("\n");
+  const nodes: React.ReactNode[] = [];
+  let codeLines: string[] = [];
+  let inCodeBlock = false;
+
+  const flushCodeBlock = (key: string) => {
+    if (codeLines.length === 0) return;
+    nodes.push(
+      <Box
+        key={key}
+        component="pre"
+        sx={{
+          m: 0,
+          mt: nodes.length ? 1 : 0,
+          p: 1,
+          borderRadius: 1,
+          bgcolor: "background.paper",
+          border: 1,
+          borderColor: "divider",
+          overflow: "auto",
+          fontFamily: "var(--font-geist-mono)",
+          fontSize: 12,
+          whiteSpace: "pre-wrap",
+          overflowWrap: "anywhere",
+        }}
+      >
+        {codeLines.join("\n")}
+      </Box>,
+    );
+    codeLines = [];
+  };
+
+  lines.forEach((line, index) => {
+    const trimmed = line.trim();
+
+    if (trimmed.startsWith("```")) {
+      if (inCodeBlock) {
+        flushCodeBlock(`code-${index}`);
+        inCodeBlock = false;
+      } else {
+        inCodeBlock = true;
+      }
+      return;
+    }
+
+    if (inCodeBlock) {
+      codeLines.push(line);
+      return;
+    }
+
+    if (!trimmed) {
+      nodes.push(<Box key={`space-${index}`} sx={{ height: 6 }} />);
+      return;
+    }
+
+    const heading = trimmed.match(/^#{1,3}\s+(.+)$/);
+    if (heading) {
+      nodes.push(
+        <Typography key={`heading-${index}`} variant="subtitle2" sx={{ fontWeight: 900, mt: nodes.length ? 1 : 0 }}>
+          {renderInlineText(heading[1])}
+        </Typography>,
+      );
+      return;
+    }
+
+    const bullet = trimmed.match(/^[-*]\s+(.+)$/);
+    if (bullet) {
+      nodes.push(
+        <Box key={`bullet-${index}`} sx={{ display: "flex", gap: 0.75, alignItems: "flex-start" }}>
+          <Typography variant="body2" sx={{ lineHeight: 1.55, color: "text.secondary" }}>•</Typography>
+          <Typography variant="body2" sx={{ lineHeight: 1.55, overflowWrap: "anywhere" }}>
+            {renderInlineText(bullet[1])}
+          </Typography>
+        </Box>,
+      );
+      return;
+    }
+
+    const numbered = trimmed.match(/^(\d+)[.)]\s+(.+)$/);
+    if (numbered) {
+      nodes.push(
+        <Box key={`numbered-${index}`} sx={{ display: "flex", gap: 0.75, alignItems: "flex-start" }}>
+          <Typography variant="body2" sx={{ minWidth: 18, lineHeight: 1.55, color: "text.secondary", fontWeight: 800 }}>
+            {numbered[1]}.
+          </Typography>
+          <Typography variant="body2" sx={{ lineHeight: 1.55, overflowWrap: "anywhere" }}>
+            {renderInlineText(numbered[2])}
+          </Typography>
+        </Box>,
+      );
+      return;
+    }
+
+    const keyValue = trimmed.match(/^([^:]{2,40}):\s+(.+)$/);
+    if (keyValue) {
+      nodes.push(
+        <Box key={`kv-${index}`} sx={{ display: "grid", gridTemplateColumns: "max-content 1fr", gap: 0.75, alignItems: "baseline" }}>
+          <Typography variant="body2" sx={{ fontWeight: 800, lineHeight: 1.55 }}>
+            {keyValue[1]}:
+          </Typography>
+          <Typography variant="body2" sx={{ lineHeight: 1.55, overflowWrap: "anywhere" }}>
+            {renderInlineText(keyValue[2])}
+          </Typography>
+        </Box>,
+      );
+      return;
+    }
+
+    nodes.push(
+      <Typography key={`text-${index}`} variant="body2" sx={{ lineHeight: 1.55, overflowWrap: "anywhere" }}>
+        {renderInlineText(trimmed)}
+      </Typography>,
+    );
+  });
+
+  flushCodeBlock("code-final");
+
+  return <Stack spacing={0.4}>{nodes}</Stack>;
+}
+
 export default function DashboardLayout({ children }: DashboardLayoutProps) {
   const [anchorEl, setAnchorEl] = React.useState<null | HTMLElement>(null);
   const [addOrgOpen, setAddOrgOpen] = React.useState(false);
@@ -299,9 +447,13 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
                     color: message.role === 'user' ? 'primary.contrastText' : 'text.primary',
                   }}
                 >
-                  <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>
-                    {message.content}
-                  </Typography>
+                  {message.role === "assistant" ? (
+                    <AssistantMessageContent content={message.content} />
+                  ) : (
+                    <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap', overflowWrap: "anywhere" }}>
+                      {message.content}
+                    </Typography>
+                  )}
                 </Box>
               ))}
             </Stack>

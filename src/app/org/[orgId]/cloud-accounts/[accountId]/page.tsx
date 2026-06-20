@@ -16,6 +16,8 @@ import {
   DialogTitle,
   Grid,
   Stack,
+  Tab,
+  Tabs,
   Divider,
   FormControlLabel,
   Typography,
@@ -81,6 +83,8 @@ interface Recommendation {
   estimatedSavings: string | null;
   severity: string | null;
   confidence: number | null;
+  resourceId?: string | null;
+  resource_id?: string | null;
 }
 
 interface UsagePolicy {
@@ -102,6 +106,7 @@ interface CostAlert {
 interface ActionPlan {
   id: string;
   actionType: string | null;
+  status: string | null;
   executionPlan: {
     recommendationTitle?: string | null;
     recommendation?: string;
@@ -118,7 +123,15 @@ interface ActionPlan {
     steps?: string[];
     awsCli?: string[];
   } | null;
+  executionLogs?: { at?: string; message?: string; triggerRunId?: string }[] | null;
   createdAt: string;
+}
+
+interface DraftActionPlan {
+  recommendationId: string;
+  resourceId: string;
+  actionType: string;
+  draftPlan: string;
 }
 
 type MetricGap = {
@@ -149,8 +162,27 @@ function formatValue(value: unknown) {
   return String(value);
 }
 
+function toFiniteNumber(value: unknown, fallback = 0) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : fallback;
+  if (typeof value !== "string") return fallback;
+
+  const match = value.replaceAll(",", "").match(/-?\d+(\.\d+)?/);
+  if (!match) return fallback;
+
+  const parsed = Number(match[0]);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function formatCurrency(value: unknown, formatter = preciseCurrency) {
+  return formatter.format(toFiniteNumber(value));
+}
+
 function tagsToText(tags: Record<string, string> | null) {
   return JSON.stringify(tags ?? {}, null, 2);
+}
+
+function getActionPlanSavings(plan: ActionPlan) {
+  return toFiniteNumber(plan.executionPlan?.estimatedSavings);
 }
 
 function getMetricGap(resource: CloudResource): MetricGap | null {
@@ -220,6 +252,10 @@ export default function CostDashboardPage() {
   const [savingTags, setSavingTags] = useState(false);
   const [actingRecommendationId, setActingRecommendationId] = useState<string | null>(null);
   const [actingPlanId, setActingPlanId] = useState<string | null>(null);
+  const [implementingPlanId, setImplementingPlanId] = useState<string | null>(null);
+  const [actionPlanTab, setActionPlanTab] = useState(0);
+  const [draftPlan, setDraftPlan] = useState<DraftActionPlan | null>(null);
+  const [approvingDraftPlan, setApprovingDraftPlan] = useState(false);
   const [tagResource, setTagResource] = useState<CloudResource | null>(null);
   const [tagText, setTagText] = useState("{}");
   const [error, setError] = useState("");
@@ -361,7 +397,7 @@ export default function CostDashboardPage() {
     }
   };
 
-  const handleRecommendationAction = async (recommendationId: string, action: "create_plan" | "mark_done" | "dismiss") => {
+  const handleRecommendationAction = async (recommendationId: string, action: "create_plan" | "mark_done" | "dismiss", resourceId?: string | null) => {
     setActingRecommendationId(recommendationId);
     setError("");
     setSuccess("");
@@ -372,7 +408,7 @@ export default function CostDashboardPage() {
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action }),
+          body: JSON.stringify({ action, resourceId }),
         },
       );
 
@@ -384,12 +420,20 @@ export default function CostDashboardPage() {
       if (data.remediation) {
         setActionPlans((current) => [data.remediation, ...current]);
       }
+      if (action === "create_plan") {
+        setDraftPlan({
+          recommendationId,
+          resourceId: resourceId ?? "",
+          actionType: data.actionType || "manual_review",
+          draftPlan: data.draftPlan || "",
+        });
+      }
       if (action !== "create_plan") {
         setRecommendations((current) => current.filter((recommendation) => recommendation.id !== recommendationId));
       }
       setSuccess(
         action === "create_plan"
-          ? "Action plan created for this recommendation."
+          ? "Draft action plan generated. Review and approve it to save the structured plan."
           : action === "mark_done"
             ? "Recommendation marked done."
             : "Recommendation dismissed.",
@@ -398,6 +442,43 @@ export default function CostDashboardPage() {
       setError(err instanceof Error ? err.message : "Failed to update recommendation");
     } finally {
       setActingRecommendationId(null);
+    }
+  };
+
+  const handleApproveDraftPlan = async () => {
+    if (!draftPlan) return;
+
+    setApprovingDraftPlan(true);
+    setError("");
+    setSuccess("");
+
+    try {
+      const response = await fetch(
+        `/api/org/${orgId}/cloud-accounts/${accountId}/recommendations/${draftPlan.recommendationId}/action`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "approve_plan",
+            resourceId: draftPlan.resourceId,
+            draftPlan: draftPlan.draftPlan,
+          }),
+        },
+      );
+
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.message || "Failed to approve action plan");
+      }
+
+      setActionPlans((current) => [data.remediation, ...current]);
+      setRecommendations((current) => current.filter((recommendation) => recommendation.id !== draftPlan.recommendationId));
+      setDraftPlan(null);
+      setSuccess("Action plan approved and saved as structured JSON.");
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Failed to approve action plan");
+    } finally {
+      setApprovingDraftPlan(false);
     }
   };
 
@@ -464,23 +545,51 @@ export default function CostDashboardPage() {
     }
   };
 
+  const handleImplementActionPlan = async (planId: string) => {
+    setImplementingPlanId(planId);
+    setError("");
+    setSuccess("");
+
+    try {
+      const response = await fetch(`/api/org/${orgId}/cloud-accounts/${accountId}/action-plans/${planId}/implement`, {
+        method: "POST",
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.message || "Failed to queue action plan implementation");
+      }
+
+      setActionPlans((current) => current.map((plan) => (plan.id === planId ? data.plan : plan)));
+      setSuccess("Action plan approved for implementation and queued in Trigger.dev.");
+      setTimeout(() => {
+        handleRefresh();
+      }, 2500);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Failed to queue action plan implementation");
+    } finally {
+      setImplementingPlanId(null);
+    }
+  };
+
   const resourcesFound = resources.length || account?.latestScanJob?.resourcesFound || 0;
   const estimatedMonthlyCost = useMemo(
-    () => resources.reduce((total, resource) => total + Number(resource.monthlyCost ?? 0), 0),
+    () => resources.reduce((total, resource) => total + toFiniteNumber(resource.monthlyCost), 0),
     [resources],
   );
   const estimatedSavings = useMemo(() => {
-    const aiSavings = recommendations.reduce((total, recommendation) => total + Number(recommendation.estimatedSavings ?? 0), 0);
+    const recommendationSavings = recommendations.reduce((total, recommendation) => total + toFiniteNumber(recommendation.estimatedSavings), 0);
+    const actionPlanSavings = actionPlans.reduce((total, plan) => total + getActionPlanSavings(plan), 0);
+    const aiSavings = recommendationSavings + actionPlanSavings;
     return Math.min(estimatedMonthlyCost, Math.max(0, aiSavings));
-  }, [estimatedMonthlyCost, recommendations]);
-  const monthlyLimit = Number((usagePolicy?.monthlyLimit ?? policyForm.monthlyLimit) || 0);
+  }, [actionPlans, estimatedMonthlyCost, recommendations]);
+  const monthlyLimit = toFiniteNumber(usagePolicy?.monthlyLimit ?? policyForm.monthlyLimit);
   const usagePercent = monthlyLimit > 0 ? Math.min(100, Math.round((estimatedMonthlyCost / monthlyLimit) * 100)) : 0;
   const thresholdPercent = Number((usagePolicy?.alertThresholdPercent ?? policyForm.alertThresholdPercent) || 80);
   const metricGaps = useMemo(() => resources.map(getMetricGap).filter((gap): gap is MetricGap => Boolean(gap)), [resources]);
   const costByService = useMemo(() => {
     const totals = new Map<string, number>();
     for (const resource of resources) {
-      totals.set(resource.service || "other", (totals.get(resource.service || "other") ?? 0) + Number(resource.monthlyCost ?? 0));
+      totals.set(resource.service || "other", (totals.get(resource.service || "other") ?? 0) + toFiniteNumber(resource.monthlyCost));
     }
     return [...totals.entries()]
       .map(([service, cost]) => ({ service, cost }))
@@ -499,6 +608,15 @@ export default function CostDashboardPage() {
   }, [resources]);
   const maxServiceCost = Math.max(...costByService.map((item) => item.cost), 1);
   const maxServiceCount = Math.max(...resourcesByService.map((item) => item.count), 1);
+  const activeActionPlans = useMemo(
+    () => actionPlans.filter((plan) => ["approved", "queued", "executing"].includes(plan.status ?? "approved")),
+    [actionPlans],
+  );
+  const completedActionPlans = useMemo(
+    () => actionPlans.filter((plan) => ["implemented", "completed", "needs_review", "failed"].includes(plan.status ?? "")),
+    [actionPlans],
+  );
+  const visibleActionPlans = actionPlanTab === 0 ? activeActionPlans : completedActionPlans;
 
   if (loading) {
     return (
@@ -836,60 +954,64 @@ export default function CostDashboardPage() {
                   </Typography>
                 ) : (
                   <Stack spacing={2}>
-                    {recommendations.map((recommendation) => (
-                      <Card key={recommendation.id} variant="outlined" sx={{ bgcolor: "background.default" }}>
-                        <CardContent sx={{ p: 2 }}>
-                          <Box sx={{ display: "flex", justifyContent: "space-between", gap: 2, mb: 1, alignItems: "flex-start" }}>
-                            <Box>
-                              <Typography sx={{ fontWeight: 900 }}>
-                                {recommendation.title || "Savings opportunity"}
-                              </Typography>
-                              <Box sx={{ display: "flex", gap: 1, flexWrap: "wrap", mt: 0.75 }}>
-                                <Chip label={recommendation.severity || "medium"} size="small" color={recommendation.severity === "high" ? "error" : "default"} />
-                                <Chip label={`${recommendation.confidence ?? 0}% confidence`} size="small" variant="outlined" />
+                    {recommendations.map((recommendation) => {
+                      const recommendationResourceId = recommendation.resourceId ?? recommendation.resource_id ?? null;
+
+                      return (
+                        <Card key={recommendation.id} variant="outlined" sx={{ bgcolor: "background.default" }}>
+                          <CardContent sx={{ p: 2 }}>
+                            <Box sx={{ display: "flex", justifyContent: "space-between", gap: 2, mb: 1, alignItems: "flex-start" }}>
+                              <Box>
+                                <Typography sx={{ fontWeight: 900 }}>
+                                  {recommendation.title || "Savings opportunity"}
+                                </Typography>
+                                <Box sx={{ display: "flex", gap: 1, flexWrap: "wrap", mt: 0.75 }}>
+                                  <Chip label={recommendation.severity || "medium"} size="small" color={recommendation.severity === "high" ? "error" : "default"} />
+                                  <Chip label={`${recommendation.confidence ?? 0}% confidence`} size="small" variant="outlined" />
+                                </Box>
                               </Box>
+                              <Chip
+                                label={`${formatCurrency(estimatedMonthlyCost > 0 ? Math.min(toFiniteNumber(recommendation.estimatedSavings), estimatedMonthlyCost) : 0)}/mo`}
+                                size="small"
+                                color="success"
+                              />
                             </Box>
-                            <Chip
-                              label={`${preciseCurrency.format(estimatedMonthlyCost > 0 ? Math.min(Number(recommendation.estimatedSavings ?? 0), estimatedMonthlyCost) : 0)}/mo`}
-                              size="small"
-                              color="success"
-                            />
-                          </Box>
-                          <Typography color="text.secondary" sx={{ mb: 1.5 }}>
-                            {recommendation.recommendation}
-                          </Typography>
-                          <Box sx={{ display: "flex", gap: 1, flexWrap: "wrap" }}>
-                            <Button
-                              size="small"
-                              variant="contained"
-                              startIcon={actingRecommendationId === recommendation.id ? <CircularProgress color="inherit" size={14} /> : <TaskAltIcon />}
-                              disabled={Boolean(actingRecommendationId)}
-                              onClick={() => handleRecommendationAction(recommendation.id, "create_plan")}
-                            >
-                              Build action plan
-                            </Button>
-                            <Button
-                              size="small"
-                              variant="outlined"
-                              startIcon={<DoneIcon />}
-                              disabled={Boolean(actingRecommendationId)}
-                              onClick={() => handleRecommendationAction(recommendation.id, "mark_done")}
-                            >
-                              Done
-                            </Button>
-                            <Button
-                              size="small"
-                              variant="text"
-                              startIcon={<CloseIcon />}
-                              disabled={Boolean(actingRecommendationId)}
-                              onClick={() => handleRecommendationAction(recommendation.id, "dismiss")}
-                            >
-                              Dismiss
-                            </Button>
-                          </Box>
-                        </CardContent>
-                      </Card>
-                    ))}
+                            <Typography color="text.secondary" sx={{ mb: 1.5 }}>
+                              {recommendation.recommendation}
+                            </Typography>
+                            <Box sx={{ display: "flex", gap: 1, flexWrap: "wrap" }}>
+                              <Button
+                                size="small"
+                                variant="contained"
+                                startIcon={actingRecommendationId === recommendation.id ? <CircularProgress color="inherit" size={14} /> : <TaskAltIcon />}
+                                disabled={Boolean(actingRecommendationId)}
+                                onClick={() => handleRecommendationAction(recommendation.id, "create_plan", recommendationResourceId)}
+                              >
+                                Build action plan
+                              </Button>
+                              <Button
+                                size="small"
+                                variant="outlined"
+                                startIcon={<DoneIcon />}
+                                disabled={Boolean(actingRecommendationId)}
+                                onClick={() => handleRecommendationAction(recommendation.id, "mark_done", recommendationResourceId)}
+                              >
+                                Done
+                              </Button>
+                              <Button
+                                size="small"
+                                variant="text"
+                                startIcon={<CloseIcon />}
+                                disabled={Boolean(actingRecommendationId)}
+                                onClick={() => handleRecommendationAction(recommendation.id, "dismiss", recommendationResourceId)}
+                              >
+                                Dismiss
+                              </Button>
+                            </Box>
+                          </CardContent>
+                        </Card>
+                      );
+                    })}
                   </Stack>
                 )}
               </CardContent>
@@ -898,11 +1020,21 @@ export default function CostDashboardPage() {
             {actionPlans.length > 0 && (
               <Card sx={{ mt: 3, border: 1, borderColor: "divider" }}>
                 <CardContent sx={{ p: 3 }}>
-                  <Typography variant="h6" sx={{ fontWeight: 900, mb: 2 }}>
-                    Action plans
-                  </Typography>
+                  <Box sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 2, mb: 2, flexWrap: "wrap" }}>
+                    <Typography variant="h6" sx={{ fontWeight: 900 }}>
+                      Action plans
+                    </Typography>
+                    <Tabs value={actionPlanTab} onChange={(_, value: number) => setActionPlanTab(value)} sx={{ minHeight: 36 }}>
+                      <Tab label={`Active (${activeActionPlans.length})`} sx={{ minHeight: 36, textTransform: "none", fontWeight: 800 }} />
+                      <Tab label={`Completed / records (${completedActionPlans.length})`} sx={{ minHeight: 36, textTransform: "none", fontWeight: 800 }} />
+                    </Tabs>
+                  </Box>
                   <Stack spacing={2}>
-                    {actionPlans.map((plan) => (
+                    {visibleActionPlans.length === 0 ? (
+                      <Typography color="text.secondary">
+                        {actionPlanTab === 0 ? "No active action plans." : "No completed plans or execution records yet."}
+                      </Typography>
+                    ) : visibleActionPlans.map((plan) => (
                       <Card key={plan.id} variant="outlined" sx={{ bgcolor: "background.default" }}>
                         <CardContent sx={{ p: 2.5 }}>
                           <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 2, mb: 1.5 }}>
@@ -920,12 +1052,29 @@ export default function CostDashboardPage() {
                                 size="small"
                                 color={plan.actionType === "ec2_rightsize_instance" ? "primary" : "default"}
                               />
+                              <Chip
+                                label={plan.status?.replaceAll("_", " ") || "approved"}
+                                size="small"
+                                color={plan.status === "failed" ? "error" : plan.status === "implemented" ? "success" : "default"}
+                                variant="outlined"
+                              />
+                              <Button
+                                disabled={Boolean(implementingPlanId) || ["queued", "executing", "implemented"].includes(plan.status ?? "")}
+                                onClick={() => handleImplementActionPlan(plan.id)}
+                                size="small"
+                                startIcon={implementingPlanId === plan.id ? <CircularProgress color="inherit" size={14} /> : <BoltIcon />}
+                                variant="contained"
+                                sx={{ display: actionPlanTab === 0 ? "inline-flex" : "none" }}
+                              >
+                                {implementingPlanId === plan.id ? "Queuing" : "Approve and implement"}
+                              </Button>
                               <Button
                                 disabled={Boolean(actingPlanId)}
                                 onClick={() => handleActionPlanDone(plan.id)}
                                 size="small"
                                 startIcon={actingPlanId === plan.id ? <CircularProgress color="inherit" size={14} /> : <DoneIcon />}
                                 variant="contained"
+                                sx={{ display: actionPlanTab === 0 ? "inline-flex" : "none" }}
                               >
                                 Done
                               </Button>
@@ -1032,6 +1181,21 @@ export default function CostDashboardPage() {
                               </Stack>
                             </Box>
                           ) : null}
+
+                          {plan.executionLogs?.length ? (
+                            <Box sx={{ mt: 2 }}>
+                              <Typography variant="subtitle2" sx={{ fontWeight: 900, mb: 0.75 }}>
+                                Execution logs
+                              </Typography>
+                              <Stack spacing={0.5}>
+                                {plan.executionLogs.slice(-5).map((log, index) => (
+                                  <Typography key={`${plan.id}-log-${index}`} variant="body2" color="text.secondary" sx={{ overflowWrap: "anywhere" }}>
+                                    {log.message || JSON.stringify(log)}
+                                  </Typography>
+                                ))}
+                              </Stack>
+                            </Box>
+                          ) : null}
                         </CardContent>
                       </Card>
                     ))}
@@ -1092,7 +1256,7 @@ export default function CostDashboardPage() {
                           </Box>
                         </Box>
                         <Typography sx={{ fontWeight: 800 }}>
-                          {preciseCurrency.format(Number(resource.monthlyCost ?? 0))}/mo
+                          {formatCurrency(resource.monthlyCost)}/mo
                         </Typography>
                         <Box>
                           <Typography color="text.secondary">
@@ -1141,6 +1305,45 @@ export default function CostDashboardPage() {
                   variant="contained"
                 >
                   {savingTags ? "Saving" : "Save tags"}
+                </Button>
+              </DialogActions>
+            </Dialog>
+
+            <Dialog open={Boolean(draftPlan)} onClose={() => setDraftPlan(null)} maxWidth="md" fullWidth>
+              <DialogTitle>Review action plan</DialogTitle>
+              <DialogContent>
+                <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                  {draftPlan?.actionType.replaceAll("_", " ") || "manual review"}
+                </Typography>
+                <Box
+                  sx={{
+                    border: 1,
+                    borderColor: "divider",
+                    borderRadius: 1,
+                    bgcolor: "background.default",
+                    p: 2,
+                    whiteSpace: "pre-wrap",
+                    overflowWrap: "anywhere",
+                    fontFamily: "var(--font-geist-mono)",
+                    fontSize: 13,
+                    maxHeight: 520,
+                    overflow: "auto",
+                  }}
+                >
+                  {draftPlan?.draftPlan}
+                </Box>
+              </DialogContent>
+              <DialogActions>
+                <Button onClick={() => setDraftPlan(null)} disabled={approvingDraftPlan}>
+                  Cancel
+                </Button>
+                <Button
+                  onClick={handleApproveDraftPlan}
+                  disabled={approvingDraftPlan}
+                  startIcon={approvingDraftPlan ? <CircularProgress color="inherit" size={16} /> : <TaskAltIcon />}
+                  variant="contained"
+                >
+                  {approvingDraftPlan ? "Approving" : "Approve plan"}
                 </Button>
               </DialogActions>
             </Dialog>
