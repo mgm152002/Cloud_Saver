@@ -18,8 +18,10 @@ import { CloudWatchLogsClient, DescribeLogGroupsCommand } from "@aws-sdk/client-
 import { generateText, stepCountIs, tool } from "ai";
 import { and, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
-import { validateAssumeRole } from "@/app/lib/aws-onboarding";
+import { parseAwsAccountId, validateAssumeRole } from "@/app/lib/aws-onboarding";
 import { createOpenRouterModel } from "@/app/lib/ai";
+import { collectCostInsights, type CollectedCostInsights } from "@/app/lib/aws-cost-explorer";
+import { persistCostInsights } from "@/app/lib/cost-insights-store";
 import { estimateMonthlyCost, estimateResourceSavings, formatMoney } from "@/app/lib/cost-estimation";
 import { getS3MetricState } from "@/app/lib/s3-metrics";
 import { db } from "@/db/db";
@@ -736,6 +738,31 @@ export const awsInitialScan = task({
       const fallbackRegion = payload.region ?? "ap-south-1";
       const regions = await getRegions(credentials, fallbackRegion);
       const resources: ScannedResource[] = [];
+      const regionErrors: Record<string, string[]> = {};
+      let costInsights: CollectedCostInsights;
+      try {
+        costInsights = await collectCostInsights(clientCredentials(credentials), {
+          accountIdentifier: parseAwsAccountId(payload.roleArn) ?? payload.cloudAccountId,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Cost Explorer collection failed";
+        costInsights = {
+          dailyCosts: [],
+          forecast: null,
+          anomalies: [],
+          serviceIncreases: [],
+          status: "unavailable",
+          message,
+          collectedAt: new Date().toISOString(),
+        };
+      }
+      await persistCostInsights(
+        db,
+        { organizationId: payload.organizationId, cloudAccountId: payload.cloudAccountId },
+        costInsights,
+      ).catch((error: unknown) => {
+        regionErrors.costPersistence = [error instanceof Error ? error.message : "Cost insights persistence failed"];
+      });
       const counts = {
         ec2Instances: 0,
         ec2Volumes: 0,
@@ -745,7 +772,6 @@ export const awsInitialScan = task({
         s3Buckets: 0,
       };
 
-      const regionErrors: Record<string, string[]> = {};
       const buckets = await countS3Buckets(credentials).catch(() => [] as Bucket[]);
       counts.s3Buckets = buckets.length;
       for (const bucket of buckets) {
@@ -940,7 +966,20 @@ export const awsInitialScan = task({
           ...(aiTagsByResourceId.get(resource.resourceId) ?? {}),
         };
       }
-      const estimatedMonthlyCost = formatMoney(resources.reduce((total, resource) => total + (resource.monthlyCost ?? 0), 0));
+      const heuristicMonthlyCost = formatMoney(resources.reduce((total, resource) => total + (resource.monthlyCost ?? 0), 0));
+      const collectedMonth = costInsights.collectedAt.slice(0, 7);
+      const monthToDateCost = formatMoney(
+        costInsights.dailyCosts
+          .filter((point) => point.dimensionType === "account" && point.date.startsWith(collectedMonth))
+          .reduce((total, point) => total + point.amount, 0),
+      );
+      const hasRealCostData = costInsights.dailyCosts.some((point) => point.dimensionType === "account");
+      const estimatedMonthlyCost = costInsights.forecast?.forecastedMonthEnd ?? (hasRealCostData ? monthToDateCost : heuristicMonthlyCost);
+      const monthlyCostSource = costInsights.forecast
+        ? "cost-explorer-forecast"
+        : hasRealCostData
+          ? "cost-explorer-month-to-date"
+          : "heuristic-fallback";
 
       const completedAt = new Date();
 
@@ -1029,6 +1068,9 @@ export const awsInitialScan = task({
             regions,
             counts,
             estimatedMonthlyCost,
+            monthlyCostSource,
+            costInsightsStatus: costInsights.status,
+            costInsightsMessage: costInsights.message,
             resourcesStored: resources.length,
             recommendationsCreated: recommendations.length,
             regionErrors,
@@ -1049,6 +1091,8 @@ export const awsInitialScan = task({
             regions,
             counts,
             estimatedMonthlyCost,
+            monthlyCostSource,
+            costInsightsStatus: costInsights.status,
             resourcesStored: resources.length,
             recommendationsCreated: recommendations.length,
             regionErrors,
@@ -1069,6 +1113,8 @@ export const awsInitialScan = task({
         scanJobId: scanJob.id,
         resourcesFound,
         estimatedMonthlyCost,
+        monthlyCostSource,
+        costInsightsStatus: costInsights.status,
         counts,
         recommendationsCreated: recommendations.length,
       };
