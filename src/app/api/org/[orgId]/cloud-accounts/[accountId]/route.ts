@@ -1,11 +1,15 @@
 import { auth } from "@/app/lib/auth";
 import { getS3MetricState } from "@/app/lib/s3-metrics";
+import { buildCostInsightsResponse } from "@/app/lib/cost-insights-response";
 import {
   aiRecommendations,
   aiRemediations,
   alerts,
   cloudAccounts,
   cloudResources,
+  costAnomalies,
+  costDailyRecords,
+  costForecasts,
   jobHistory,
   organizations,
   resourceCostHistory,
@@ -13,7 +17,7 @@ import {
   usagePolicies,
 } from "@/db/auth-schema";
 import { db } from "@/db/db";
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray } from "drizzle-orm";
 
 function shouldShowRecommendation(
   recommendation: { title: string | null; recommendation: string },
@@ -167,7 +171,54 @@ export async function GET(
     .orderBy(desc(aiRemediations.createdAt))
     .limit(5);
 
-  const estimatedMonthlyCost = resources.reduce((total, resource) => total + Number(resource.monthlyCost ?? 0), 0);
+  const historyStart = new Date();
+  historyStart.setUTCDate(historyStart.getUTCDate() - 30);
+  const historyStartDate = historyStart.toISOString().slice(0, 10);
+  const [storedDailyCosts, storedForecast, storedAnomalies] = await Promise.all([
+    db
+      .select({
+        costDate: costDailyRecords.costDate,
+        dimensionType: costDailyRecords.dimensionType,
+        dimensionValue: costDailyRecords.dimensionValue,
+        amount: costDailyRecords.amount,
+        currency: costDailyRecords.currency,
+        estimated: costDailyRecords.estimated,
+      })
+      .from(costDailyRecords)
+      .where(and(eq(costDailyRecords.cloudAccountId, accountId), gte(costDailyRecords.costDate, historyStartDate)))
+      .orderBy(asc(costDailyRecords.costDate)),
+    db
+      .select()
+      .from(costForecasts)
+      .where(eq(costForecasts.cloudAccountId, accountId))
+      .limit(1)
+      .then((rows) => rows[0] ?? null),
+    db
+      .select({
+        anomalyDate: costAnomalies.anomalyDate,
+        service: costAnomalies.service,
+        actualCost: costAnomalies.actualCost,
+        baselineCost: costAnomalies.baselineCost,
+        increaseAmount: costAnomalies.increaseAmount,
+        increasePercent: costAnomalies.increasePercent,
+        severity: costAnomalies.severity,
+        likelyResourceId: costAnomalies.likelyResourceId,
+        attributionStatus: costAnomalies.attributionStatus,
+        explanation: costAnomalies.explanation,
+      })
+      .from(costAnomalies)
+      .where(and(eq(costAnomalies.cloudAccountId, accountId), eq(costAnomalies.status, "open")))
+      .orderBy(desc(costAnomalies.anomalyDate))
+      .limit(20),
+  ]);
+
+  const legacyEstimatedMonthlyCost = resources.reduce((total, resource) => total + Number(resource.monthlyCost ?? 0), 0);
+  const { costInsights, estimatedMonthlyCost, monthlyCostSource } = buildCostInsightsResponse({
+    dailyRecords: storedDailyCosts,
+    forecast: storedForecast,
+    anomalies: storedAnomalies,
+    legacyEstimatedMonthlyCost,
+  });
   const recommendationSavings = recommendations.reduce((total, recommendation) => total + Number(recommendation.estimatedSavings ?? 0), 0);
   const actionPlanSavings = actionPlans.reduce((total, plan) => {
     const executionPlan = plan.executionPlan as { estimatedSavings?: string | number | null } | null;
@@ -195,9 +246,11 @@ export async function GET(
     actionPlans,
     usagePolicy: usagePolicy ?? null,
     alerts: recentAlerts,
+    costInsights,
     totals: {
       estimatedMonthlyCost,
       estimatedSavings,
+      monthlyCostSource,
     },
   });
 }
