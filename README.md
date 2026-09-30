@@ -102,6 +102,8 @@ The connected-account role needs these Cost Explorer actions:
 
 The reviewable role template is in `cloud_formation/get_access.yaml`. Republish that file to the hosted onboarding-template location when deploying this change. Cost Explorer access can take time to begin returning data, and resource attribution is shown as unavailable when AWS does not support it for the affected service or billing scope.
 
+Cost display and anomaly thresholds currently support USD billing data. CloudSaver reports other or mixed currencies as unavailable instead of labeling them as dollars.
+
 ## Getting Started
 
 ### Prerequisites

@@ -223,3 +223,62 @@ test("rejects a forecast whose currency differs from daily cost data", async () 
   assert.equal(result.status, "partial");
   assert.match(result.message ?? "", /currency/i);
 });
+
+test("does not present non-USD daily costs as dollar amounts", async () => {
+  const client = fakeClient((commandName) => {
+    if (commandName === "GetCostAndUsageCommand") {
+      return {
+        ResultsByTime: dailyResponse().ResultsByTime.map((result) => ({
+          ...result,
+          Groups: result.Groups.map((group) => ({
+            ...group,
+            Metrics: { UnblendedCost: { ...group.Metrics.UnblendedCost, Unit: "EUR" } },
+          })),
+        })),
+      };
+    }
+    throw new Error(`Unexpected command ${commandName}`);
+  });
+
+  const result = await collectCostInsights(credentials, { now: new Date("2026-09-29T12:00:00.000Z"), client });
+
+  assert.equal(result.status, "unavailable");
+  assert.deepEqual(result.dailyCosts, []);
+  assert.equal(result.forecast, null);
+  assert.match(result.message ?? "", /USD/i);
+});
+
+test("treats an omitted service group as zero when complete daily history exists", async () => {
+  const client = fakeClient((commandName) => {
+    if (commandName === "GetCostAndUsageCommand") {
+      return {
+        ResultsByTime: [
+          ...baselineDates.map((date) => ({
+            TimePeriod: { Start: date, End: nextDate(date) },
+            Estimated: false,
+            Groups: [{ Keys: ["S3"], Metrics: { UnblendedCost: { Amount: "1", Unit: "USD" } } }],
+          })),
+          {
+            TimePeriod: { Start: latestDate, End: nextDate(latestDate) },
+            Estimated: false,
+            Groups: [
+              { Keys: ["S3"], Metrics: { UnblendedCost: { Amount: "1", Unit: "USD" } } },
+              { Keys: ["Lambda"], Metrics: { UnblendedCost: { Amount: "5", Unit: "USD" } } },
+            ],
+          },
+        ],
+      };
+    }
+    if (commandName === "GetCostForecastCommand") return { Total: { Amount: "1", Unit: "USD" } };
+    if (commandName === "GetCostAndUsageWithResourcesCommand") return { ResultsByTime: [] };
+    throw new Error(`Unexpected command ${commandName}`);
+  });
+
+  const result = await collectCostInsights(credentials, { now: new Date("2026-09-29T12:00:00.000Z"), client });
+  const lambdaAnomaly = result.anomalies.find((anomaly) => anomaly.service === "Lambda");
+
+  assert.ok(lambdaAnomaly);
+  assert.equal(lambdaAnomaly.baselineCost, 0);
+  assert.equal(lambdaAnomaly.actualCost, 5);
+  assert.equal(lambdaAnomaly.increasePercent, null);
+});

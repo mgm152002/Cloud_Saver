@@ -123,6 +123,8 @@ export function buildCostDateWindows(now: Date): CostDateWindows {
 
 async function fetchDailyCosts(client: CostExplorerClientLike, window: DateInterval, accountIdentifier: string) {
   const serviceByDate = new Map<string, { amount: number; currency: string; estimated: boolean }>();
+  const observedDates = new Map<string, boolean>();
+  const serviceCurrencies = new Map<string, string>();
   let nextPageToken: string | undefined;
 
   do {
@@ -139,10 +141,12 @@ async function fetchDailyCosts(client: CostExplorerClientLike, window: DateInter
     for (const result of response.ResultsByTime ?? []) {
       const date = result.TimePeriod?.Start;
       if (!date) continue;
+      observedDates.set(date, Boolean(observedDates.get(date) || result.Estimated));
       for (const group of result.Groups ?? []) {
         const service = group.Keys?.[0];
         const metric = group.Metrics?.UnblendedCost;
         if (!service || !metric?.Unit) continue;
+        serviceCurrencies.set(service, metric.Unit);
         const key = `${date}\u0000${service}`;
         const previous = serviceByDate.get(key);
         serviceByDate.set(key, {
@@ -154,6 +158,15 @@ async function fetchDailyCosts(client: CostExplorerClientLike, window: DateInter
     }
     nextPageToken = response.NextPageToken;
   } while (nextPageToken);
+
+  for (const [date, estimated] of observedDates) {
+    for (const [service, currency] of serviceCurrencies) {
+      const key = `${date}\u0000${service}`;
+      if (!serviceByDate.has(key)) {
+        serviceByDate.set(key, { amount: 0, currency, estimated });
+      }
+    }
+  }
 
   const servicePoints = [...serviceByDate.entries()].map(([key, value]) => {
     const [date, service] = key.split("\u0000");
@@ -310,6 +323,11 @@ export async function collectCostInsights(
 
   if (!dailyCosts.some((point) => point.dimensionType === "account")) {
     return unavailableResult(now, "AWS Cost Explorer returned no billing data for the selected period.");
+  }
+
+  const currencies = new Set(dailyCosts.map((point) => point.currency));
+  if (currencies.size !== 1 || !currencies.has("USD")) {
+    return unavailableResult(now, "CloudSaver currently supports USD Cost Explorer data only.");
   }
 
   const messages: string[] = [];
