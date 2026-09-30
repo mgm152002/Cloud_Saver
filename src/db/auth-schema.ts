@@ -184,7 +184,7 @@ export const costDailyRecords = pgTable(
       .references(() => organizations.id)
       .notNull(),
     cloudAccountId: uuid("cloud_account_id")
-      .references(() => cloudAccounts.id)
+      .references(() => cloudAccounts.id, { onDelete: "cascade" })
       .notNull(),
     costDate: date("cost_date").notNull(),
     dimensionType: varchar("dimension_type", { length: 50 }).notNull(),
@@ -213,7 +213,7 @@ export const costForecasts = pgTable(
       .references(() => organizations.id)
       .notNull(),
     cloudAccountId: uuid("cloud_account_id")
-      .references(() => cloudAccounts.id)
+      .references(() => cloudAccounts.id, { onDelete: "cascade" })
       .notNull(),
     monthStart: date("month_start"),
     monthEnd: date("month_end"),
@@ -238,7 +238,7 @@ export const costAnomalies = pgTable(
       .references(() => organizations.id)
       .notNull(),
     cloudAccountId: uuid("cloud_account_id")
-      .references(() => cloudAccounts.id)
+      .references(() => cloudAccounts.id, { onDelete: "cascade" })
       .notNull(),
     anomalyDate: date("anomaly_date").notNull(),
     dimensionType: varchar("dimension_type", { length: 50 }).notNull(),

@@ -1,7 +1,7 @@
 CREATE TABLE "cost_daily_records" (
   "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
   "organization_id" uuid NOT NULL REFERENCES "organizations"("id"),
-  "cloud_account_id" uuid NOT NULL REFERENCES "cloud_accounts"("id"),
+  "cloud_account_id" uuid NOT NULL REFERENCES "cloud_accounts"("id") ON DELETE CASCADE,
   "cost_date" date NOT NULL,
   "dimension_type" varchar(50) NOT NULL,
   "dimension_value" varchar(500) NOT NULL,
@@ -19,7 +19,7 @@ CREATE INDEX "cost_daily_account_date_idx"
 CREATE TABLE "cost_forecasts" (
   "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
   "organization_id" uuid NOT NULL REFERENCES "organizations"("id"),
-  "cloud_account_id" uuid NOT NULL REFERENCES "cloud_accounts"("id"),
+  "cloud_account_id" uuid NOT NULL REFERENCES "cloud_accounts"("id") ON DELETE CASCADE,
   "month_start" date,
   "month_end" date,
   "month_to_date" numeric(14, 2),
@@ -39,7 +39,7 @@ CREATE UNIQUE INDEX "cost_forecasts_account_idx"
 CREATE TABLE "cost_anomalies" (
   "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
   "organization_id" uuid NOT NULL REFERENCES "organizations"("id"),
-  "cloud_account_id" uuid NOT NULL REFERENCES "cloud_accounts"("id"),
+  "cloud_account_id" uuid NOT NULL REFERENCES "cloud_accounts"("id") ON DELETE CASCADE,
   "anomaly_date" date NOT NULL,
   "dimension_type" varchar(50) NOT NULL,
   "dimension_value" varchar(500) NOT NULL,
