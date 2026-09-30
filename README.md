@@ -88,6 +88,22 @@ Cloud cost optimization platform that scans your AWS infrastructure and provides
 - **Lambda**: Functions, runtimes, memory configuration
 - **ELB**: Load balancers, type, scheme
 
+## Real cost data and anomaly detection
+
+Each AWS scan also reads Cost Explorer and stores daily account and service spend. The account dashboard shows month-to-date spend, the AWS forecast for month end, daily spend history, service increases, and the most likely resource behind a spike when AWS provides resource-level cost data.
+
+CloudSaver's transparent baseline compares the latest completed UTC day with the preceding seven completed days. It opens an anomaly only when the increase is both at least **$5** and **50%**; new spend from a zero baseline is flagged at **$5**. Severity is based on the dollar increase: low below $20, medium from $20, and high from $50.
+
+The connected-account role needs these Cost Explorer actions:
+
+- `ce:GetCostAndUsage`
+- `ce:GetCostForecast`
+- `ce:GetCostAndUsageWithResources`
+
+The reviewable role template is in `cloud_formation/get_access.yaml`. Republish that file to the hosted onboarding-template location when deploying this change. Cost Explorer access can take time to begin returning data, and resource attribution is shown as unavailable when AWS does not support it for the affected service or billing scope.
+
+Cost display and anomaly thresholds currently support USD billing data. CloudSaver reports other or mixed currencies as unavailable instead of labeling them as dollars.
+
 ## Getting Started
 
 ### Prerequisites
@@ -198,11 +214,13 @@ cloudsaver_frontend/
 The Trigger.dev worker (`aws-initial-scan`) performs:
 
 1. **Credential Validation**: Assumes IAM role with external ID
-2. **Multi-Region Scanning**: Iterates through all AWS regions
-3. **Resource Discovery**: Collects EC2, RDS, S3, Lambda, ELB resources
-4. **Metrics Collection**: Fetches CloudWatch CPU utilization for EC2
-5. **AI Analysis**: Sends resource data to OpenRouter for recommendations
-6. **Database Update**: Stores resources and recommendations
+2. **Cost Collection**: Reads daily spend and forecast data from Cost Explorer
+3. **Anomaly Detection**: Applies the documented seven-day baseline and attempts resource attribution
+4. **Multi-Region Scanning**: Iterates through all AWS regions
+5. **Resource Discovery**: Collects EC2, RDS, S3, Lambda, ELB resources
+6. **Metrics Collection**: Fetches CloudWatch utilization metrics
+7. **AI Analysis**: Sends resource data to OpenRouter for recommendations
+8. **Database Update**: Stores resources, costs, anomalies, and recommendations
 
 ## Environment Variables
 

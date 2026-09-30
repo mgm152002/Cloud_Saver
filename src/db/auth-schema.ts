@@ -1,5 +1,5 @@
 import { relations } from "drizzle-orm";
-import { pgTable, text, timestamp, boolean, index,
+import { pgTable, text, timestamp, boolean, date, index, uniqueIndex,
   uuid,
   varchar,
   jsonb,
@@ -175,6 +175,98 @@ export const resourceCostHistory = pgTable("resource_cost_history", {
   dailyCost: numeric("daily_cost", { precision: 10, scale: 2 }).notNull(),
   monthlyProjection: numeric("monthly_projection", { precision: 10, scale: 2 }),
 });
+
+export const costDailyRecords = pgTable(
+  "cost_daily_records",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    organizationId: uuid("organization_id")
+      .references(() => organizations.id)
+      .notNull(),
+    cloudAccountId: uuid("cloud_account_id")
+      .references(() => cloudAccounts.id, { onDelete: "cascade" })
+      .notNull(),
+    costDate: date("cost_date").notNull(),
+    dimensionType: varchar("dimension_type", { length: 50 }).notNull(),
+    dimensionValue: varchar("dimension_value", { length: 500 }).notNull(),
+    amount: numeric("amount", { precision: 14, scale: 2 }).notNull(),
+    currency: varchar("currency", { length: 8 }).notNull(),
+    estimated: boolean("estimated").default(false).notNull(),
+    collectedAt: timestamp("collected_at").defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("cost_daily_account_date_dimension_idx").on(
+      table.cloudAccountId,
+      table.costDate,
+      table.dimensionType,
+      table.dimensionValue,
+    ),
+    index("cost_daily_account_date_idx").on(table.cloudAccountId, table.costDate),
+  ],
+);
+
+export const costForecasts = pgTable(
+  "cost_forecasts",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    organizationId: uuid("organization_id")
+      .references(() => organizations.id)
+      .notNull(),
+    cloudAccountId: uuid("cloud_account_id")
+      .references(() => cloudAccounts.id, { onDelete: "cascade" })
+      .notNull(),
+    monthStart: date("month_start"),
+    monthEnd: date("month_end"),
+    monthToDate: numeric("month_to_date", { precision: 14, scale: 2 }),
+    predictedRemaining: numeric("predicted_remaining", { precision: 14, scale: 2 }),
+    forecastedMonthEnd: numeric("forecasted_month_end", { precision: 14, scale: 2 }),
+    lowerBound: numeric("lower_bound", { precision: 14, scale: 2 }),
+    upperBound: numeric("upper_bound", { precision: 14, scale: 2 }),
+    currency: varchar("currency", { length: 8 }),
+    status: varchar("status", { length: 50 }).default("unavailable").notNull(),
+    errorMessage: text("error_message"),
+    lastSyncedAt: timestamp("last_synced_at").defaultNow().notNull(),
+  },
+  (table) => [uniqueIndex("cost_forecasts_account_idx").on(table.cloudAccountId)],
+);
+
+export const costAnomalies = pgTable(
+  "cost_anomalies",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    organizationId: uuid("organization_id")
+      .references(() => organizations.id)
+      .notNull(),
+    cloudAccountId: uuid("cloud_account_id")
+      .references(() => cloudAccounts.id, { onDelete: "cascade" })
+      .notNull(),
+    anomalyDate: date("anomaly_date").notNull(),
+    dimensionType: varchar("dimension_type", { length: 50 }).notNull(),
+    dimensionValue: varchar("dimension_value", { length: 500 }).notNull(),
+    service: varchar("service", { length: 500 }),
+    actualCost: numeric("actual_cost", { precision: 14, scale: 2 }).notNull(),
+    baselineCost: numeric("baseline_cost", { precision: 14, scale: 2 }).notNull(),
+    increaseAmount: numeric("increase_amount", { precision: 14, scale: 2 }).notNull(),
+    increasePercent: numeric("increase_percent", { precision: 10, scale: 2 }),
+    severity: varchar("severity", { length: 50 }).notNull(),
+    explanation: text("explanation").notNull(),
+    likelyResourceId: varchar("likely_resource_id", { length: 500 }),
+    resourceIncreaseAmount: numeric("resource_increase_amount", { precision: 14, scale: 2 }),
+    attributionStatus: varchar("attribution_status", { length: 100 }).notNull(),
+    status: varchar("status", { length: 50 }).default("open").notNull(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    updatedAt: timestamp("updated_at").defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("cost_anomalies_account_date_dimension_idx").on(
+      table.cloudAccountId,
+      table.anomalyDate,
+      table.dimensionType,
+      table.dimensionValue,
+    ),
+    index("cost_anomalies_account_date_idx").on(table.cloudAccountId, table.anomalyDate),
+  ],
+);
 
 export const aiRecommendations = pgTable("ai_recommendations", {
   id: uuid("id").defaultRandom().primaryKey(),
