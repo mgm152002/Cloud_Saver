@@ -43,6 +43,8 @@ import HistoryIcon from "@mui/icons-material/History";
 import LocalOfferIcon from "@mui/icons-material/LocalOffer";
 import EditIcon from "@mui/icons-material/Edit";
 import DashboardLayout from "../../../../../components/dashboard-layout";
+import { buildCostDashboardViewModel } from "../../../../lib/cost-dashboard";
+import type { CostInsightsResponse } from "../../../../lib/cost-insights-response";
 import { getS3MetricState } from "../../../../lib/s3-metrics";
 
 interface CloudAccount {
@@ -147,11 +149,23 @@ interface CostDashboardPayload {
   actionPlans: ActionPlan[];
   usagePolicy: UsagePolicy | null;
   alerts: CostAlert[];
+  costInsights: CostInsightsResponse;
   totals: {
     estimatedMonthlyCost: number;
     estimatedSavings: number;
+    monthlyCostSource: string;
   };
 }
+
+const emptyCostInsights: CostInsightsResponse = {
+  dailySpend: [],
+  forecast: null,
+  serviceIncreases: [],
+  anomalies: [],
+  status: "unavailable",
+  message: null,
+  lastSyncedAt: null,
+};
 
 const currency = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
 const preciseCurrency = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 });
@@ -245,6 +259,8 @@ export default function CostDashboardPage() {
   const [actionPlans, setActionPlans] = useState<ActionPlan[]>([]);
   const [usagePolicy, setUsagePolicy] = useState<UsagePolicy | null>(null);
   const [alerts, setAlerts] = useState<CostAlert[]>([]);
+  const [costInsights, setCostInsights] = useState<CostInsightsResponse>(emptyCostInsights);
+  const [costTotals, setCostTotals] = useState({ estimatedMonthlyCost: 0, monthlyCostSource: "heuristic-fallback" });
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [scanning, setScanning] = useState(false);
@@ -288,6 +304,11 @@ export default function CostDashboardPage() {
           setActionPlans(data.actionPlans);
           setUsagePolicy(data.usagePolicy);
           setAlerts(data.alerts);
+          setCostInsights(data.costInsights);
+          setCostTotals({
+            estimatedMonthlyCost: data.totals.estimatedMonthlyCost,
+            monthlyCostSource: data.totals.monthlyCostSource,
+          });
           setPolicyForm({
             monthlyLimit: data.usagePolicy?.monthlyLimit ?? "",
             alertThresholdPercent: String(data.usagePolicy?.alertThresholdPercent ?? 80),
@@ -324,6 +345,11 @@ export default function CostDashboardPage() {
       setActionPlans(data.actionPlans);
       setUsagePolicy(data.usagePolicy);
       setAlerts(data.alerts);
+      setCostInsights(data.costInsights);
+      setCostTotals({
+        estimatedMonthlyCost: data.totals.estimatedMonthlyCost,
+        monthlyCostSource: data.totals.monthlyCostSource,
+      });
       setPolicyForm({
         monthlyLimit: data.usagePolicy?.monthlyLimit ?? "",
         alertThresholdPercent: String(data.usagePolicy?.alertThresholdPercent ?? 80),
@@ -572,10 +598,15 @@ export default function CostDashboardPage() {
   };
 
   const resourcesFound = resources.length || account?.latestScanJob?.resourcesFound || 0;
-  const estimatedMonthlyCost = useMemo(
-    () => resources.reduce((total, resource) => total + toFiniteNumber(resource.monthlyCost), 0),
-    [resources],
+  const costDashboard = useMemo(
+    () => buildCostDashboardViewModel({
+      costInsights,
+      estimatedMonthlyCost: costTotals.estimatedMonthlyCost,
+      monthlyCostSource: costTotals.monthlyCostSource,
+    }),
+    [costInsights, costTotals],
   );
+  const estimatedMonthlyCost = costDashboard.projectedMonthlyCost;
   const estimatedSavings = useMemo(() => {
     const recommendationSavings = recommendations.reduce((total, recommendation) => total + toFiniteNumber(recommendation.estimatedSavings), 0);
     const actionPlanSavings = actionPlans.reduce((total, plan) => total + getActionPlanSavings(plan), 0);
@@ -586,28 +617,7 @@ export default function CostDashboardPage() {
   const usagePercent = monthlyLimit > 0 ? Math.min(100, Math.round((estimatedMonthlyCost / monthlyLimit) * 100)) : 0;
   const thresholdPercent = Number((usagePolicy?.alertThresholdPercent ?? policyForm.alertThresholdPercent) || 80);
   const metricGaps = useMemo(() => resources.map(getMetricGap).filter((gap): gap is MetricGap => Boolean(gap)), [resources]);
-  const costByService = useMemo(() => {
-    const totals = new Map<string, number>();
-    for (const resource of resources) {
-      totals.set(resource.service || "other", (totals.get(resource.service || "other") ?? 0) + toFiniteNumber(resource.monthlyCost));
-    }
-    return [...totals.entries()]
-      .map(([service, cost]) => ({ service, cost }))
-      .sort((left, right) => right.cost - left.cost)
-      .slice(0, 6);
-  }, [resources]);
-  const resourcesByService = useMemo(() => {
-    const totals = new Map<string, number>();
-    for (const resource of resources) {
-      totals.set(resource.service || "other", (totals.get(resource.service || "other") ?? 0) + 1);
-    }
-    return [...totals.entries()]
-      .map(([service, count]) => ({ service, count }))
-      .sort((left, right) => right.count - left.count)
-      .slice(0, 6);
-  }, [resources]);
-  const maxServiceCost = Math.max(...costByService.map((item) => item.cost), 1);
-  const maxServiceCount = Math.max(...resourcesByService.map((item) => item.count), 1);
+  const maxServiceIncrease = Math.max(...costInsights.serviceIncreases.map((item) => item.increaseAmount), 1);
   const activeActionPlans = useMemo(
     () => actionPlans.filter((plan) => ["approved", "queued", "executing"].includes(plan.status ?? "approved")),
     [actionPlans],
@@ -701,6 +711,12 @@ export default function CostDashboardPage() {
                 {success}
               </Alert>
             )}
+            {costInsights.status !== "available" && (
+              <Alert severity={costInsights.status === "partial" ? "warning" : "info"} sx={{ mb: 3 }}>
+                {costInsights.message || "Cost Explorer data is not available yet. Run a scan after granting billing permissions."}
+                {costDashboard.isHeuristicFallback && " Existing resource estimates are used only for limit tracking."}
+              </Alert>
+            )}
 
             <Grid container spacing={2.5}>
               <Grid size={{ xs: 12, md: 3 }}>
@@ -719,9 +735,20 @@ export default function CostDashboardPage() {
                   <CardContent sx={{ p: 2.5 }}>
                     <AssessmentIcon color="primary" />
                     <Typography variant="h4" sx={{ mt: 1, fontWeight: 900 }}>
-                      {currency.format(estimatedMonthlyCost)}
+                      {costDashboard.monthToDateSpend === null ? "Unavailable" : currency.format(costDashboard.monthToDateSpend)}
                     </Typography>
-                    <Typography color="text.secondary">Estimated monthly cost</Typography>
+                    <Typography color="text.secondary">Month-to-date spend</Typography>
+                  </CardContent>
+                </Card>
+              </Grid>
+              <Grid size={{ xs: 12, md: 3 }}>
+                <Card sx={{ height: "100%", border: 1, borderColor: "divider", bgcolor: "background.paper" }}>
+                  <CardContent sx={{ p: 2.5 }}>
+                    <InsertChartIcon color="primary" />
+                    <Typography variant="h4" sx={{ mt: 1, fontWeight: 900 }}>
+                      {costDashboard.forecastedMonthEnd === null ? "Unavailable" : currency.format(costDashboard.forecastedMonthEnd)}
+                    </Typography>
+                    <Typography color="text.secondary">Forecasted month end</Typography>
                   </CardContent>
                 </Card>
               </Grid>
@@ -733,17 +760,6 @@ export default function CostDashboardPage() {
                       {currency.format(estimatedSavings)}
                     </Typography>
                     <Typography color="text.secondary">AI-backed savings</Typography>
-                  </CardContent>
-                </Card>
-              </Grid>
-              <Grid size={{ xs: 12, md: 3 }}>
-                <Card sx={{ height: "100%", border: 1, borderColor: usagePercent >= thresholdPercent ? "warning.main" : "divider", bgcolor: "background.paper" }}>
-                  <CardContent sx={{ p: 2.5 }}>
-                    <NotificationsActiveIcon color={usagePercent >= thresholdPercent ? "warning" : "primary"} />
-                    <Typography variant="h4" sx={{ mt: 1, fontWeight: 900 }}>
-                      {monthlyLimit > 0 ? `${usagePercent}%` : "Off"}
-                    </Typography>
-                    <Typography color="text.secondary">Limit usage</Typography>
                   </CardContent>
                 </Card>
               </Grid>
@@ -800,7 +816,7 @@ export default function CostDashboardPage() {
                       />
                       <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
                         {monthlyLimit > 0
-                          ? `${preciseCurrency.format(estimatedMonthlyCost)} projected against ${preciseCurrency.format(monthlyLimit)} monthly limit`
+                          ? `${preciseCurrency.format(estimatedMonthlyCost)} ${costDashboard.isHeuristicFallback ? "estimated" : "projected"} against ${preciseCurrency.format(monthlyLimit)} monthly limit`
                           : "Set a monthly limit to enable projected spend tracking."}
                       </Typography>
                     </Box>
@@ -865,6 +881,60 @@ export default function CostDashboardPage() {
               </Card>
             )}
 
+            <Card sx={{ mt: 3, border: 1, borderColor: costInsights.anomalies.length > 0 ? "warning.main" : "divider" }}>
+              <CardContent sx={{ p: 3 }}>
+                <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 2, mb: 2 }}>
+                  <Box>
+                    <Typography variant="h6" sx={{ fontWeight: 900 }}>
+                      Cost anomalies
+                    </Typography>
+                    <Typography variant="body2" color="text.secondary">
+                      Latest completed day compared with the preceding seven-day baseline.
+                    </Typography>
+                  </Box>
+                  <Chip label={`${costInsights.anomalies.length} open`} color={costInsights.anomalies.length > 0 ? "warning" : "default"} />
+                </Box>
+                {costInsights.anomalies.length === 0 ? (
+                  <Typography color="text.secondary">No cost spikes crossed the transparent dollar and percentage thresholds.</Typography>
+                ) : (
+                  <Stack divider={<Divider />} spacing={0}>
+                    {costInsights.anomalies.map((anomaly) => (
+                      <Box key={`${anomaly.date}-${anomaly.service || "account"}`} sx={{ py: 1.5 }}>
+                        <Box sx={{ display: "flex", justifyContent: "space-between", gap: 2, flexWrap: "wrap" }}>
+                          <Box>
+                            <Box sx={{ display: "flex", alignItems: "center", gap: 1, flexWrap: "wrap" }}>
+                              <Typography sx={{ fontWeight: 900 }}>{anomaly.service || "Account total"}</Typography>
+                              <Chip
+                                label={anomaly.severity}
+                                size="small"
+                                color={anomaly.severity === "high" ? "error" : anomaly.severity === "medium" ? "warning" : "default"}
+                              />
+                            </Box>
+                            <Typography color="text.secondary" sx={{ mt: 0.5 }}>{anomaly.explanation}</Typography>
+                            <Typography variant="body2" sx={{ mt: 0.75, fontWeight: 700 }}>
+                              {anomaly.likelyResourceId
+                                ? `Likely resource: ${anomaly.likelyResourceId}`
+                                : anomaly.attributionStatus === "resource_data_unavailable"
+                                  ? "Resource-level attribution is unavailable for this billing scope."
+                                  : "No single resource could be identified from Cost Explorer."}
+                            </Typography>
+                          </Box>
+                          <Box sx={{ textAlign: { xs: "left", sm: "right" } }}>
+                            <Typography sx={{ fontWeight: 900, color: "warning.main" }}>
+                              +{preciseCurrency.format(anomaly.increaseAmount)}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              {anomaly.increasePercent === null ? "new spend" : `${anomaly.increasePercent.toFixed(1)}% increase`} · {anomaly.date}
+                            </Typography>
+                          </Box>
+                        </Box>
+                      </Box>
+                    ))}
+                  </Stack>
+                )}
+              </CardContent>
+            </Card>
+
             {metricGaps.length > 0 && (
               <Card sx={{ mt: 3, border: 1, borderColor: "warning.main" }}>
                 <CardContent sx={{ p: 3 }}>
@@ -893,24 +963,41 @@ export default function CostDashboardPage() {
                     <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 2 }}>
                       <InsertChartIcon color="primary" />
                       <Typography variant="h6" sx={{ fontWeight: 900 }}>
-                        Cost by service
+                        Daily spend
                       </Typography>
                     </Box>
-                    <Stack spacing={1.5}>
-                      {costByService.length === 0 ? (
-                        <Typography color="text.secondary">No cost data yet.</Typography>
-                      ) : costByService.map((item) => (
-                        <Box key={item.service}>
-                          <Box sx={{ display: "flex", justifyContent: "space-between", mb: 0.5 }}>
-                            <Typography sx={{ fontWeight: 800 }}>{item.service}</Typography>
-                            <Typography color="text.secondary">{preciseCurrency.format(item.cost)}</Typography>
-                          </Box>
-                          <Box sx={{ height: 10, bgcolor: "action.hover", borderRadius: 1, overflow: "hidden" }}>
-                            <Box sx={{ height: "100%", width: `${Math.max(4, (item.cost / maxServiceCost) * 100)}%`, bgcolor: "primary.main" }} />
-                          </Box>
+                    {costInsights.dailySpend.length === 0 ? (
+                      <Typography color="text.secondary">No Cost Explorer history is available yet.</Typography>
+                    ) : (
+                      <>
+                        <Box sx={{ height: 190, display: "flex", alignItems: "flex-end", gap: 0.6, px: 0.5, borderBottom: 1, borderColor: "divider" }}>
+                          {costInsights.dailySpend.map((point) => (
+                            <Box
+                              key={point.date}
+                              title={`${point.date}: ${preciseCurrency.format(point.amount)}${point.estimated ? " (estimated)" : ""}`}
+                              sx={{
+                                flex: 1,
+                                minWidth: 3,
+                                height: `${Math.max(2, (point.amount / costDashboard.dailySpendMaximum) * 100)}%`,
+                                bgcolor: point.estimated ? "warning.main" : "primary.main",
+                                borderRadius: "3px 3px 0 0",
+                              }}
+                            />
+                          ))}
                         </Box>
-                      ))}
-                    </Stack>
+                        <Box sx={{ display: "flex", justifyContent: "space-between", mt: 1 }}>
+                          <Typography variant="caption" color="text.secondary">{costInsights.dailySpend[0]?.date}</Typography>
+                          <Typography variant="caption" color="text.secondary">
+                            {costInsights.dailySpend.at(-1)?.date} · hover bars for values
+                          </Typography>
+                        </Box>
+                        {costInsights.lastSyncedAt && (
+                          <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 1 }}>
+                            Synced {new Date(costInsights.lastSyncedAt).toLocaleString()}
+                          </Typography>
+                        )}
+                      </>
+                    )}
                   </CardContent>
                 </Card>
               </Grid>
@@ -920,21 +1007,26 @@ export default function CostDashboardPage() {
                     <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 2 }}>
                       <InsertChartIcon color="primary" />
                       <Typography variant="h6" sx={{ fontWeight: 900 }}>
-                        Resources by service
+                        Service cost increases
                       </Typography>
                     </Box>
                     <Stack spacing={1.5}>
-                      {resourcesByService.length === 0 ? (
-                        <Typography color="text.secondary">No inventory data yet.</Typography>
-                      ) : resourcesByService.map((item) => (
+                      {costInsights.serviceIncreases.length === 0 ? (
+                        <Typography color="text.secondary">No positive service-level increases found for the latest completed day.</Typography>
+                      ) : costInsights.serviceIncreases.slice(0, 6).map((item) => (
                         <Box key={item.service}>
                           <Box sx={{ display: "flex", justifyContent: "space-between", mb: 0.5 }}>
                             <Typography sx={{ fontWeight: 800 }}>{item.service}</Typography>
-                            <Typography color="text.secondary">{item.count}</Typography>
+                            <Typography color="text.secondary">
+                              +{preciseCurrency.format(item.increaseAmount)}{item.increasePercent === null ? " new" : ` (${item.increasePercent.toFixed(1)}%)`}
+                            </Typography>
                           </Box>
                           <Box sx={{ height: 10, bgcolor: "action.hover", borderRadius: 1, overflow: "hidden" }}>
-                            <Box sx={{ height: "100%", width: `${Math.max(4, (item.count / maxServiceCount) * 100)}%`, bgcolor: "success.main" }} />
+                            <Box sx={{ height: "100%", width: `${Math.max(4, (item.increaseAmount / maxServiceIncrease) * 100)}%`, bgcolor: "warning.main" }} />
                           </Box>
+                          <Typography variant="caption" color="text.secondary">
+                            {preciseCurrency.format(item.latestCost)} latest vs {preciseCurrency.format(item.baselineCost)} baseline
+                          </Typography>
                         </Box>
                       ))}
                     </Stack>
